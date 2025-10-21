@@ -39,11 +39,12 @@ from PyQt5.QtWidgets import (
 )
 
 try:
-    from Xlib import X, XK, display
+    from Xlib import X, XK, display, error as xerror
 except ImportError:  # pragma: no cover - optional dependency
     display = None  # type: ignore
     XK = None  # type: ignore
     X = None  # type: ignore
+    xerror = None  # type: ignore
 
 from .background import Background
 from .config import Config
@@ -179,6 +180,8 @@ class SuperKeyListener(QObject):
         self._root = None
         self._keycodes: Set[int] = set()
 
+        self._previous_error_handler = None
+
         if display is None:
             return
 
@@ -213,43 +216,86 @@ class SuperKeyListener(QObject):
         self._thread = None
 
     def _install_grabs(self) -> None:
-        if self._display is None or self._root is None or XK is None or X is None:
+        if (
+            self._display is None
+            or self._root is None
+            or XK is None
+            or X is None
+            or xerror is None
+        ):
             return
 
         modifier_masks = self._modifier_combinations()
 
-        for name in SUPER_KEY_SYMS:
-            keysym = XK.string_to_keysym(name)
-            if keysym == 0:
-                continue
-            keycode = self._display.keysym_to_keycode(keysym)
-            if keycode == 0:
-                continue
-            self._keycodes.add(keycode)
-            for mask in modifier_masks:
-                try:
-                    self._root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
-                except Exception:
-                    continue
+        self._previous_error_handler = getattr(self._display, "error_handler", None)
+        self._display.set_error_handler(self._handle_x_error)
+
         try:
-            self._display.sync()
-        except Exception:
-            pass
+            grabbed_any = False
+            for name in SUPER_KEY_SYMS:
+                keysym = XK.string_to_keysym(name)
+                if keysym == 0:
+                    continue
+                keycode = self._display.keysym_to_keycode(keysym)
+                if keycode == 0:
+                    continue
+                key_grabbed = False
+                for mask in modifier_masks:
+                    try:
+                        self._root.grab_key(
+                            keycode,
+                            mask,
+                            True,
+                            X.GrabModeAsync,
+                            X.GrabModeAsync,
+                        )
+                        self._display.sync()
+                        key_grabbed = True
+                        grabbed_any = True
+                    except xerror.XError:
+                        continue
+                    except Exception:
+                        continue
+                if key_grabbed:
+                    self._keycodes.add(keycode)
+
+            if not grabbed_any:
+                self._keycodes.clear()
+
+            try:
+                self._display.sync()
+            except Exception:
+                pass
+        finally:
+            self._restore_error_handler()
 
     def _release_grabs(self) -> None:
-        if self._display is None or self._root is None or X is None:
+        if (
+            self._display is None
+            or self._root is None
+            or X is None
+            or xerror is None
+        ):
             return
-        for keycode in self._keycodes:
-            for mask in self._modifier_combinations():
-                try:
-                    self._root.ungrab_key(keycode, mask)
-                except Exception:
-                    continue
+        self._previous_error_handler = getattr(self._display, "error_handler", None)
+        self._display.set_error_handler(self._handle_x_error)
         try:
-            self._display.sync()
-        except Exception:
-            pass
-        self._keycodes.clear()
+            for keycode in self._keycodes:
+                for mask in self._modifier_combinations():
+                    try:
+                        self._root.ungrab_key(keycode, mask)
+                        self._display.sync()
+                    except xerror.XError:
+                        continue
+                    except Exception:
+                        continue
+            try:
+                self._display.sync()
+            except Exception:
+                pass
+        finally:
+            self._keycodes.clear()
+            self._restore_error_handler()
 
     def _run(self) -> None:
         if self._display is None or X is None:
@@ -276,6 +322,7 @@ class SuperKeyListener(QObject):
                 pass
         self._display = None
         self._root = None
+        self._previous_error_handler = None
 
     @staticmethod
     def _modifier_combinations() -> Set[int]:
@@ -291,6 +338,21 @@ class SuperKeyListener(QObject):
         combos.add(X.LockMask | X.Mod2Mask | X.Mod5Mask)
         combos.add(getattr(X, "AnyModifier", 0))
         return combos or {0}
+
+    def _handle_x_error(self, err, *_args):
+        if xerror is not None and isinstance(err, xerror.XError):
+            raise err
+        return 0
+
+    def _restore_error_handler(self) -> None:
+        if self._display is None:
+            return
+        handler = self._previous_error_handler
+        if handler is None:
+            if xerror is not None:
+                handler = xerror.default_error_handler
+        self._display.set_error_handler(handler)
+        self._previous_error_handler = handler
 
 
 class SearchField(QLineEdit):
