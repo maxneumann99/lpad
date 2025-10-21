@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lpad"
+version = "0.1.0"
+description = "Fullscreen application launcher inspired by macOS Launchpad"
+authors = [{name = "Launchpad"}]
+requires-python = ">=3.9"
+dependencies = [
+    "PyQt5>=5.15",
+]
+
+[project.scripts]
+lpad = "lpad.app:main"
