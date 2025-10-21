@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtCore import QEvent, QEasingCurve, QPointF, QSize, Qt, QTimer, pyqtSignal, QPropertyAnimation
-from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QKeySequence
+from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPalette
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -21,7 +21,6 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QToolButton,
-    QShortcut,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +32,17 @@ from .desktop_entries import DesktopEntry, iter_desktop_entries
 COLUMNS = 7
 ROWS = 5
 ITEMS_PER_PAGE = COLUMNS * ROWS
+
+
+class SearchField(QLineEdit):
+    navigate_requested = pyqtSignal(int)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() == Qt.Key_Left:
+            self.navigate_requested.emit(-1)
+        elif event.key() == Qt.Key_Right:
+            self.navigate_requested.emit(1)
+        super().keyPressEvent(event)
 
 
 class LaunchpadWindow(QMainWindow):
@@ -59,7 +69,7 @@ class LaunchpadWindow(QMainWindow):
         main_layout.setContentsMargins(40, 40, 40, 40)
         main_layout.setSpacing(20)
 
-        self.search_field = QLineEdit()
+        self.search_field = SearchField()
         self.search_field.setPlaceholderText("Поиск приложений")
         self.search_field.setClearButtonEnabled(True)
         self.search_field.textChanged.connect(self._filter_entries)
@@ -81,6 +91,7 @@ class LaunchpadWindow(QMainWindow):
         self.grid = AppGrid()
         self.grid.page_changed.connect(self._on_page_changed)
         self.grid.hide_requested.connect(self._hide_entry)
+        self.search_field.navigate_requested.connect(self.grid.navigate)
         center_layout.addWidget(self.grid, 1)
 
         self.right_button = NavigationButton("▶")
@@ -90,10 +101,6 @@ class LaunchpadWindow(QMainWindow):
         self.pagination = PaginationDots()
         main_layout.addWidget(self.pagination, alignment=Qt.AlignHCenter)
 
-        self._left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
-        self._left_shortcut.activated.connect(lambda: self.grid.navigate(-1))
-        self._right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
-        self._right_shortcut.activated.connect(lambda: self.grid.navigate(1))
 
     def _load_entries(self) -> None:
         self.entries = iter_desktop_entries(hidden=self.config.hidden)
