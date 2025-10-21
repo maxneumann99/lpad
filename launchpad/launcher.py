@@ -25,9 +25,13 @@ PAGE_SIZE = ROWS * COLUMNS
 class BlurBackground(QtWidgets.QLabel):
     """Label that displays a blurred snapshot of the desktop."""
 
+    backgroundChanged = QtCore.pyqtSignal()
+
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setScaledContents(True)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background: transparent;")
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
         super().resizeEvent(event)
@@ -54,6 +58,7 @@ class BlurBackground(QtWidgets.QLabel):
         # Use QGraphicsBlurEffect to blur the pixmap
         blur_radius = 30
         temp_widget = QtWidgets.QGraphicsScene()
+        temp_widget.setBackgroundBrush(QtCore.Qt.transparent)
         pixmap_item = QtWidgets.QGraphicsPixmapItem(QtGui.QPixmap.fromImage(image))
         blur_effect = QtWidgets.QGraphicsBlurEffect()
         blur_effect.setBlurRadius(blur_radius)
@@ -61,13 +66,14 @@ class BlurBackground(QtWidgets.QLabel):
         temp_widget.addItem(pixmap_item)
 
         buffer = QtGui.QImage(image.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
-        buffer.fill(0)
+        buffer.fill(QtCore.Qt.transparent)
 
         painter = QtGui.QPainter(buffer)
         temp_widget.render(painter)
         painter.end()
 
         self.setPixmap(QtGui.QPixmap.fromImage(buffer))
+        self.backgroundChanged.emit()
 
 
 class AppIconButton(QtWidgets.QToolButton):
@@ -85,6 +91,8 @@ class AppIconButton(QtWidgets.QToolButton):
         self.setIconSize(QtCore.QSize(96, 96))
         self.setAutoRaise(True)
         self.setCursor(QtCore.Qt.PointingHandCursor)
+        self._text_color = QtGui.QColor(QtCore.Qt.white)
+        self._apply_stylesheet()
 
     def _load_icon(self, icon_name: Optional[str]) -> QtGui.QIcon:
         if not icon_name:
@@ -110,6 +118,30 @@ class AppIconButton(QtWidgets.QToolButton):
         if event.button() == QtCore.Qt.LeftButton and self.rect().contains(event.pos()):
             self.triggered.emit(self.entry)
         super().mouseReleaseEvent(event)
+
+    def set_text_color(self, color: QtGui.QColor) -> None:
+        if color == self._text_color:
+            return
+        self._text_color = color
+        self._apply_stylesheet()
+
+    def _apply_stylesheet(self) -> None:
+        rgba = (self._text_color.red(), self._text_color.green(), self._text_color.blue(), self._text_color.alpha())
+        self.setStyleSheet(
+            "QToolButton {"
+            " background: transparent;"
+            f" color: rgba({rgba[0]}, {rgba[1]}, {rgba[2]}, {rgba[3]});"
+            " border: none;"
+            "}"
+            "QToolButton:hover {"
+            " background: rgba(255, 255, 255, 30);"
+            " border-radius: 12px;"
+            "}"
+            "QToolButton:pressed {"
+            " background: rgba(255, 255, 255, 60);"
+            " border-radius: 12px;"
+            "}"
+        )
 
 
 class PaginationDots(QtWidgets.QWidget):
@@ -167,16 +199,28 @@ class LauncherWindow(QtWidgets.QWidget):
         self._filtered_entries: List[DesktopEntry] = []
         self._hidden_ids = self._load_hidden_ids()
         self._current_page = 0
+        self._buttons: List[AppIconButton] = []
 
         self.background = BlurBackground(self)
         self.background.setGeometry(self.rect())
         self.background.lower()
+        self.background.backgroundChanged.connect(self._update_label_colors)
 
         self.search_field = QtWidgets.QLineEdit(self)
         self.search_field.setPlaceholderText("Search")
         self.search_field.setClearButtonEnabled(True)
         self.search_field.setFixedHeight(44)
         self.search_field.textChanged.connect(self._apply_filter)
+        self.search_field.setStyleSheet(
+            "QLineEdit {"
+            " background: rgba(0, 0, 0, 160);"
+            " color: white;"
+            " border: 1px solid rgba(255, 255, 255, 60);"
+            " border-radius: 20px;"
+            " padding: 0 16px;"
+            "}"
+            "QLineEdit::placeholder { color: rgba(255, 255, 255, 180); }"
+        )
 
         font = self.search_field.font()
         font.setPointSize(16)
@@ -198,6 +242,7 @@ class LauncherWindow(QtWidgets.QWidget):
 
         self.pages = QtWidgets.QStackedWidget(self)
         self.pages.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.pages.installEventFilter(self)
 
         self.pagination = PaginationDots(self)
 
@@ -216,6 +261,7 @@ class LauncherWindow(QtWidgets.QWidget):
         layout.addLayout(pages_container, stretch=1)
         layout.addWidget(self.pagination, alignment=QtCore.Qt.AlignHCenter)
 
+        self.installEventFilter(self)
         self._load_entries_async()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: D401
@@ -226,6 +272,7 @@ class LauncherWindow(QtWidgets.QWidget):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401
         super().resizeEvent(event)
         self.background.setGeometry(self.rect())
+        QtCore.QTimer.singleShot(0, self._update_label_colors)
 
     # Data management -------------------------------------------------
 
@@ -256,6 +303,8 @@ class LauncherWindow(QtWidgets.QWidget):
             self.pages.removeWidget(widget)
             widget.deleteLater()
 
+        self._buttons.clear()
+
         for page_entries in chunked(self._filtered_entries, PAGE_SIZE):
             page_widget = self._create_page(page_entries)
             self.pages.addWidget(page_widget)
@@ -272,9 +321,11 @@ class LauncherWindow(QtWidgets.QWidget):
             self.pages.addWidget(empty_widget)
             self.pages.setCurrentWidget(empty_widget)
         self.pagination.set_state(self._current_page, total_pages)
+        QtCore.QTimer.singleShot(0, self._update_label_colors)
 
     def _create_page(self, entries: Sequence[DesktopEntry]) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
+        widget.installEventFilter(self)
         grid = QtWidgets.QGridLayout(widget)
         grid.setContentsMargins(20, 20, 20, 20)
         grid.setHorizontalSpacing(30)
@@ -286,7 +337,9 @@ class LauncherWindow(QtWidgets.QWidget):
             button = AppIconButton(entry)
             button.triggered.connect(self._launch_entry)
             button.request_hide.connect(self._hide_entry)
+            button.installEventFilter(self)
             grid.addWidget(button, row, column, alignment=QtCore.Qt.AlignCenter)
+            self._buttons.append(button)
 
         # Fill remaining cells with spacers to maintain layout
         total_cells = ROWS * COLUMNS
@@ -316,6 +369,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.pagination.set_state(self._current_page, total_pages)
         self.arrow_left.setEnabled(self._current_page > 0)
         self.arrow_right.setEnabled(self._current_page < total_pages - 1)
+        QtCore.QTimer.singleShot(0, self._update_label_colors)
 
     # Interaction -----------------------------------------------------
 
@@ -364,6 +418,39 @@ class LauncherWindow(QtWidgets.QWidget):
                 json.dump(data, fh, indent=2)
         except OSError:
             pass
+
+    # Appearance ------------------------------------------------------
+
+    def _update_label_colors(self) -> None:
+        pixmap = self.background.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        image = pixmap.toImage()
+        for button in self._buttons:
+            center = button.rect().center()
+            mapped = button.mapTo(self.background, center)
+            if not image.rect().contains(mapped):
+                button.set_text_color(QtGui.QColor(QtCore.Qt.white))
+                continue
+            color = QtGui.QColor(image.pixel(mapped))
+            luminance = QtGui.qGray(color.rgb())
+            if luminance > 160:
+                button.set_text_color(QtGui.QColor(20, 20, 20))
+            else:
+                button.set_text_color(QtGui.QColor(245, 245, 245))
+
+    # Event handling --------------------------------------------------
+
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if event.type() == QtCore.QEvent.Wheel:
+            if isinstance(event, QtGui.QWheelEvent):
+                delta = event.angleDelta().y()
+                if delta > 0:
+                    self._show_previous_page()
+                elif delta < 0:
+                    self._show_next_page()
+            return True
+        return super().eventFilter(watched, event)
 
 
 def chunked(items: Iterable[DesktopEntry], size: int) -> Iterable[List[DesktopEntry]]:
