@@ -32,6 +32,9 @@ class BlurBackground(QtWidgets.QLabel):
         self.setScaledContents(True)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent;")
+        self._blur_effect = QtWidgets.QGraphicsBlurEffect(self)
+        self._blur_effect.setBlurRadius(40)
+        self.setGraphicsEffect(self._blur_effect)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
         super().resizeEvent(event)
@@ -42,37 +45,41 @@ class BlurBackground(QtWidgets.QLabel):
         QtCore.QTimer.singleShot(0, self._update_background)
 
     def _update_background(self) -> None:
+        if not self.isVisible():
+            return
         screen = QtWidgets.QApplication.primaryScreen()
         if screen is None:
             return
 
-        pixmap = screen.grabWindow(0)
-        if pixmap.isNull():
+        try:
+            pixmap = screen.grabWindow(0)
+        except RuntimeError:
             return
 
-        if self.size().isValid():
-            pixmap = pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation)
+        if pixmap.isNull() or not self.size().isValid():
+            return
 
-        image = pixmap.toImage()
+        scaled = pixmap.scaled(
+            self.size(),
+            QtCore.Qt.KeepAspectRatioByExpanding,
+            QtCore.Qt.SmoothTransformation,
+        )
 
-        # Use QGraphicsBlurEffect to blur the pixmap
-        blur_radius = 30
-        temp_widget = QtWidgets.QGraphicsScene()
-        temp_widget.setBackgroundBrush(QtCore.Qt.transparent)
-        pixmap_item = QtWidgets.QGraphicsPixmapItem(QtGui.QPixmap.fromImage(image))
-        blur_effect = QtWidgets.QGraphicsBlurEffect()
-        blur_effect.setBlurRadius(blur_radius)
-        pixmap_item.setGraphicsEffect(blur_effect)
-        temp_widget.addItem(pixmap_item)
+        if scaled.size() != self.size():
+            x = max((scaled.width() - self.width()) // 2, 0)
+            y = max((scaled.height() - self.height()) // 2, 0)
+            cropped = scaled.copy(x, y, self.width(), self.height())
+        else:
+            cropped = scaled
 
-        buffer = QtGui.QImage(image.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
+        buffer = QtGui.QPixmap(self.size())
         buffer.fill(QtCore.Qt.transparent)
-
         painter = QtGui.QPainter(buffer)
-        temp_widget.render(painter)
+        painter.drawPixmap(0, 0, cropped)
+        painter.fillRect(buffer.rect(), QtGui.QColor(0, 0, 0, 120))
         painter.end()
 
-        self.setPixmap(QtGui.QPixmap.fromImage(buffer))
+        self.setPixmap(buffer)
         self.backgroundChanged.emit()
 
 
