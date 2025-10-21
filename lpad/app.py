@@ -103,10 +103,7 @@ class LaunchpadWindow(QMainWindow):
 
 
     def _load_entries(self) -> None:
-        self.entries = iter_desktop_entries(hidden=self.config.hidden)
-        self.grid.set_entries(self.entries)
-        self.pagination.update_state(self.grid.page_count, self.grid.current_page)
-        self._update_arrow_visibility()
+        self._refresh_entries(self.search_field.text())
 
     def _filter_entries(self, text: str) -> None:
         query = text.strip().lower()
@@ -114,14 +111,23 @@ class LaunchpadWindow(QMainWindow):
             filtered = self.entries
         else:
             filtered = [entry for entry in self.entries if query in entry.name.lower()]
-        self.grid.set_entries(filtered)
+        self._apply_entries(filtered)
+
+    def _apply_entries(self, entries: List[DesktopEntry]) -> None:
+        self.grid.set_entries(entries)
         self.pagination.update_state(self.grid.page_count, self.grid.current_page)
         self._update_arrow_visibility()
 
+    def _refresh_entries(self, search_text: Optional[str] = None) -> None:
+        self.entries = iter_desktop_entries(hidden=self.config.hidden)
+        if search_text is None:
+            search_text = self.search_field.text()
+        self._filter_entries(search_text)
+
     def _hide_entry(self, entry: DesktopEntry) -> None:
         self.config.add_hidden(str(entry.desktop_file))
-        self._load_entries()
-        self._filter_entries(self.search_field.text())
+        search_text = self.search_field.text()
+        QTimer.singleShot(0, lambda text=search_text: self._refresh_entries(text))
 
     def _apply_background(self) -> None:
         if self.background.pixmap:
