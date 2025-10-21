@@ -461,8 +461,20 @@ class PaginationDots(QWidget):
 
 
 def main() -> None:
-    # Support running both as script and module.
+    """Launch the application, handling Ctrl+C gracefully."""
+
     app = QApplication(sys.argv)
-    window = LaunchpadWindow()
-    window.showFullScreen()
-    sys.exit(app.exec_())
+    window: Optional[LaunchpadWindow] = None
+    exit_code = 0
+    try:
+        window = LaunchpadWindow()
+        window.showFullScreen()
+        exit_code = app.exec_()
+    except KeyboardInterrupt:
+        exit_code = 130
+    finally:
+        if window is not None:
+            window.close()
+        app.quit()
+
+    sys.exit(exit_code)
