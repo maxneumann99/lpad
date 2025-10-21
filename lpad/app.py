@@ -168,13 +168,6 @@ class LaunchpadWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
-    def wheelEvent(self, event) -> None:  # type: ignore[override]
-        if event.angleDelta().y() > 0:
-            self.grid.navigate(-1)
-        elif event.angleDelta().y() < 0:
-            self.grid.navigate(1)
-        super().wheelEvent(event)
-
 
 class NavigationButton(QPushButton):
     def __init__(self, text: str) -> None:
@@ -308,16 +301,21 @@ class AppGrid(QWidget):
             delta = event.angleDelta()
             if delta.x() > 0 or delta.y() > 0:
                 self.navigate(-1)
+                event.accept()
             elif delta.x() < 0 or delta.y() < 0:
                 self.navigate(1)
-            return True
+                event.accept()
+            if event.isAccepted():
+                return True
         if event.type() == QEvent.KeyPress:
             key = event.key()
             if key in (Qt.Key_Left, Qt.Key_PageUp):
                 self.navigate(-1)
+                event.accept()
                 return True
             if key in (Qt.Key_Right, Qt.Key_PageDown):
                 self.navigate(1)
+                event.accept()
                 return True
         return super().eventFilter(obj, event)
 
