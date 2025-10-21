@@ -198,6 +198,8 @@ class AppGrid(QWidget):
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setWidgetResizable(True)
+        self.scroll.setFocusPolicy(Qt.NoFocus)
+        self.scroll.viewport().setFocusPolicy(Qt.NoFocus)
         self.scroll.viewport().installEventFilter(self)
         self.scroll.installEventFilter(self)
         self.scroll.setStyleSheet(
@@ -303,6 +305,14 @@ class AppGrid(QWidget):
             elif delta.x() < 0 or delta.y() < 0:
                 self.navigate(1)
             return True
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Left, Qt.Key_PageUp):
+                self.navigate(-1)
+                return True
+            if key in (Qt.Key_Right, Qt.Key_PageDown):
+                self.navigate(1)
+                return True
         return super().eventFilter(obj, event)
 
 
