@@ -35,6 +35,8 @@ class BlurBackground(QtWidgets.QLabel):
         self._blur_effect = QtWidgets.QGraphicsBlurEffect(self)
         self._blur_effect.setBlurRadius(40)
         self.setGraphicsEffect(self._blur_effect)
+        self._last_pixmap: Optional[QtGui.QPixmap] = None
+        self._warned_capture = False
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
         super().resizeEvent(event)
@@ -45,19 +47,51 @@ class BlurBackground(QtWidgets.QLabel):
         QtCore.QTimer.singleShot(0, self._update_background)
 
     def _update_background(self) -> None:
-        if not self.isVisible():
+        if not self.isVisible() or not self.size().isValid():
             return
+
         screen = QtWidgets.QApplication.primaryScreen()
         if screen is None:
             return
 
-        try:
-            pixmap = screen.grabWindow(0)
-        except RuntimeError:
+        pixmap: Optional[QtGui.QPixmap] = None
+        if not self._capture_disallowed():
+            try:
+                candidate = screen.grabWindow(0)
+            except RuntimeError:
+                candidate = QtGui.QPixmap()
+
+            if not candidate.isNull():
+                pixmap = candidate
+        else:
+            self._warn_once()
+
+        if pixmap is not None:
+            buffer = self._render_buffer(pixmap)
+            self._last_pixmap = buffer
+        else:
+            buffer = self._fallback_buffer()
+
+        if buffer is None:
             return
 
-        if pixmap.isNull() or not self.size().isValid():
+        self.setPixmap(buffer)
+        self.backgroundChanged.emit()
+
+    def _capture_disallowed(self) -> bool:
+        platform_name = (QtGui.QGuiApplication.platformName() or "").lower()
+        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        return "wayland" in platform_name or session_type == "wayland"
+
+    def _warn_once(self) -> None:
+        if self._warned_capture:
             return
+        self._warned_capture = True
+        QtCore.qWarning("Wallpaper blur disabled: screen capture is not supported on this platform.")
+
+    def _render_buffer(self, pixmap: QtGui.QPixmap) -> Optional[QtGui.QPixmap]:
+        if pixmap.isNull():
+            return None
 
         scaled = pixmap.scaled(
             self.size(),
@@ -78,9 +112,26 @@ class BlurBackground(QtWidgets.QLabel):
         painter.drawPixmap(0, 0, cropped)
         painter.fillRect(buffer.rect(), QtGui.QColor(0, 0, 0, 120))
         painter.end()
+        return buffer
 
-        self.setPixmap(buffer)
-        self.backgroundChanged.emit()
+    def _fallback_buffer(self) -> Optional[QtGui.QPixmap]:
+        if self._last_pixmap and not self._last_pixmap.isNull():
+            if self._last_pixmap.size() == self.size():
+                return self._last_pixmap
+            fallback = self._last_pixmap.scaled(
+                self.size(),
+                QtCore.Qt.IgnoreAspectRatio,
+                QtCore.Qt.SmoothTransformation,
+            )
+            return fallback
+
+        fallback = QtGui.QPixmap(self.size())
+        fallback.fill(QtCore.Qt.transparent)
+        painter = QtGui.QPainter(fallback)
+        painter.fillRect(fallback.rect(), QtGui.QColor(0, 0, 0, 160))
+        painter.end()
+        self._last_pixmap = fallback
+        return fallback
 
 
 class AppIconButton(QtWidgets.QToolButton):
