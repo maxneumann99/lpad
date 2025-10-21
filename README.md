@@ -8,7 +8,7 @@ Fullscreen application launcher inspired by macOS Launchpad. The launcher is wri
 - Presents applications in a 7×5 grid with smooth page animations and pagination dots.
 - Instant search field focused whenever the launcher is shown for keyboard-driven filtering.
 - Launches hidden and toggles fullscreen display with the <kbd>Super</kbd>/<kbd>Win</kbd>/<kbd>Mod4</kbd> key.
-- Keyboard (arrow keys), mouse wheel, on-screen arrows for page navigation, and Escape to hide the launcher.
+- Keyboard (arrow keys), mouse wheel, on-screen arrows for page navigation, and Escape to hide the launcher (or exit when run with `--fg`).
 - Right-click context menu to hide unwanted launchers, persisted in `~/.config/lpad/conf.json`.
 - Background image configurable via `~/.config/lpad/conf.json`; falls back to desktop wallpaper (GNOME via `gsettings`) or a plain white backdrop.
 - Automatic icon label contrast based on background brightness.
@@ -62,5 +62,15 @@ python -m lpad
 ```
 
 The launcher starts in the background. Press the <kbd>Super</kbd>/<kbd>Win</kbd>/<kbd>Mod4</kbd> key to open it fullscreen. Start typing to filter, use the arrows or mouse wheel to change pages, and press <kbd>Esc</kbd> (or the hotkey again) to hide the window.
+
+To disable the background mode (for example, if you prefer the launcher to behave like a regular fullscreen app), start it with the `--fg` flag:
+
+```bash
+lpad --fg
+# or
+python3 main.py --fg
+```
+
+In this mode the window opens immediately and pressing <kbd>Esc</kbd> closes the application.
 
 If the X11 global hotkey cannot be registered (for example on a Wayland-only session or when `python-xlib` is missing), the launcher opens immediately on startup so it remains accessible, and you can still hide/show it manually.

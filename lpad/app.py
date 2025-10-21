@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import threading
@@ -308,11 +309,11 @@ class SuperKeyListener(QObject):
             except Exception:
                 break
             if event.type == X.KeyPress and event.detail in self._keycodes:
-                if not self._pressed:
-                    self._pressed = True
-                    self.triggered.emit()
+                self._pressed = True
             elif event.type == X.KeyRelease and event.detail in self._keycodes:
-                self._pressed = False
+                if self._pressed:
+                    self._pressed = False
+                    self.triggered.emit()
 
     def _cleanup_display(self) -> None:
         if self._display is not None:
@@ -367,7 +368,7 @@ class SearchField(QLineEdit):
 
 
 class LaunchpadWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, background_mode: bool = True) -> None:
         super().__init__()
         self.setWindowTitle("Launchpad")
         self.setWindowFlag(Qt.FramelessWindowHint, False)
@@ -376,13 +377,18 @@ class LaunchpadWindow(QMainWindow):
         self.config = Config.load()
         self.background = Background(self.config)
 
-        self._super_listener = SuperKeyListener(self)
-        self._super_listener.triggered.connect(self.handle_super_key)
+        self._background_mode = background_mode
+        self._super_listener: Optional[SuperKeyListener] = None
+        if self._background_mode:
+            self._super_listener = SuperKeyListener(self)
+            self._super_listener.triggered.connect(self.handle_super_key)
 
         self._build_ui()
         self._load_entries()
         self._apply_background()
-        if not self._super_listener.is_active:
+        if not self._background_mode:
+            self.show_launcher()
+        elif not self._super_listener or not self._super_listener.is_active:
             self.show_launcher()
 
     def handle_super_key(self) -> None:
@@ -398,7 +404,10 @@ class LaunchpadWindow(QMainWindow):
         QTimer.singleShot(0, self.search_field.setFocus)
 
     def hide_launcher(self) -> None:
-        self.hide()
+        if self._background_mode:
+            self.hide()
+        else:
+            self.close()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -521,7 +530,8 @@ class LaunchpadWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        self._super_listener.stop()
+        if self._super_listener is not None:
+            self._super_listener.stop()
         super().closeEvent(event)
 
 
@@ -835,14 +845,27 @@ class PaginationDots(QWidget):
         painter.end()
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Launch the application, handling Ctrl+C gracefully."""
 
-    app = QApplication(sys.argv)
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(prog="lpad", add_help=True)
+    parser.add_argument(
+        "--fg",
+        action="store_true",
+        help="run in the foreground (show immediately and close on Esc)",
+    )
+    args, qt_args = parser.parse_known_args(argv)
+
+    qt_argv = [sys.argv[0], *qt_args]
+
+    app = QApplication(qt_argv)
     window: Optional[LaunchpadWindow] = None
     exit_code = 0
     try:
-        window = LaunchpadWindow()
+        window = LaunchpadWindow(background_mode=not args.fg)
         exit_code = app.exec_()
     except KeyboardInterrupt:
         exit_code = 130
