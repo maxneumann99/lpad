@@ -1,0 +1,395 @@
+"""Graphical launcher application similar to macOS Launchpad."""
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Set
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from .desktop_entry import DesktopEntry, load_entries, launch_entry
+
+APP_NAME = "launchpad"
+_config_root = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CONFIG_DIR = _config_root / APP_NAME
+HIDDEN_FILE = CONFIG_DIR / "hidden.json"
+
+ROWS = 7
+COLUMNS = 5
+PAGE_SIZE = ROWS * COLUMNS
+
+
+class BlurBackground(QtWidgets.QLabel):
+    """Label that displays a blurred snapshot of the desktop."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setScaledContents(True)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
+        super().resizeEvent(event)
+        self._update_background()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: D401 - inherited docstring
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, self._update_background)
+
+    def _update_background(self) -> None:
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return
+
+        pixmap = screen.grabWindow(0)
+        if pixmap.isNull():
+            return
+
+        if self.size().isValid():
+            pixmap = pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation)
+
+        image = pixmap.toImage()
+
+        # Use QGraphicsBlurEffect to blur the pixmap
+        blur_radius = 30
+        temp_widget = QtWidgets.QGraphicsScene()
+        pixmap_item = QtWidgets.QGraphicsPixmapItem(QtGui.QPixmap.fromImage(image))
+        blur_effect = QtWidgets.QGraphicsBlurEffect()
+        blur_effect.setBlurRadius(blur_radius)
+        pixmap_item.setGraphicsEffect(blur_effect)
+        temp_widget.addItem(pixmap_item)
+
+        buffer = QtGui.QImage(image.size(), QtGui.QImage.Format_ARGB32_Premultiplied)
+        buffer.fill(0)
+
+        painter = QtGui.QPainter(buffer)
+        temp_widget.render(painter)
+        painter.end()
+
+        self.setPixmap(QtGui.QPixmap.fromImage(buffer))
+
+
+class AppIconButton(QtWidgets.QToolButton):
+    """Button representing an application icon with a label."""
+
+    triggered = QtCore.pyqtSignal(DesktopEntry)
+    request_hide = QtCore.pyqtSignal(DesktopEntry)
+
+    def __init__(self, entry: DesktopEntry, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.entry = entry
+        self.setToolButtonStyle(QtCore.Qt.ToolButtonTextUnderIcon)
+        self.setText(entry.name)
+        self.setIcon(self._load_icon(entry.icon))
+        self.setIconSize(QtCore.QSize(96, 96))
+        self.setAutoRaise(True)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def _load_icon(self, icon_name: Optional[str]) -> QtGui.QIcon:
+        if not icon_name:
+            return QtGui.QIcon.fromTheme("application-x-executable")
+        icon = QtGui.QIcon.fromTheme(icon_name)
+        if not icon.isNull():
+            return icon
+        if os.path.isabs(icon_name) and os.path.exists(icon_name):
+            return QtGui.QIcon(icon_name)
+        return QtGui.QIcon.fromTheme("application-x-executable")
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: D401
+        if event.button() == QtCore.Qt.RightButton:
+            menu = QtWidgets.QMenu(self)
+            hide_action = menu.addAction("Hide")
+            action = menu.exec_(self.mapToGlobal(event.pos()))
+            if action == hide_action:
+                self.request_hide.emit(self.entry)
+        else:
+            super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: D401
+        if event.button() == QtCore.Qt.LeftButton and self.rect().contains(event.pos()):
+            self.triggered.emit(self.entry)
+        super().mouseReleaseEvent(event)
+
+
+class PaginationDots(QtWidgets.QWidget):
+    """Widget that draws pagination dots."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self._current = 0
+        self._total = 0
+        self.setFixedHeight(24)
+
+    def set_state(self, current: int, total: int) -> None:
+        self._current = current
+        self._total = total
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: D401
+        super().paintEvent(event)
+        if self._total <= 1:
+            return
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+
+        available_width = self.width()
+        dot_size = 10
+        spacing = 10
+        total_width = self._total * dot_size + (self._total - 1) * spacing
+        start_x = max((available_width - total_width) // 2, 0)
+        y = self.height() // 2
+
+        for index in range(self._total):
+            rect = QtCore.QRect(start_x + index * (dot_size + spacing), y - dot_size // 2, dot_size, dot_size)
+            color = QtGui.QColor(255, 255, 255, 200 if index == self._current else 80)
+            painter.setBrush(color)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(rect)
+
+
+class LauncherWindow(QtWidgets.QWidget):
+    """Main window for the launchpad application."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowFlags(
+            QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.WindowSystemMenuHint
+            | QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.NoDropShadowWindowHint
+        )
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+
+        self._all_entries: List[DesktopEntry] = []
+        self._filtered_entries: List[DesktopEntry] = []
+        self._hidden_ids = self._load_hidden_ids()
+        self._current_page = 0
+
+        self.background = BlurBackground(self)
+        self.background.setGeometry(self.rect())
+        self.background.lower()
+
+        self.search_field = QtWidgets.QLineEdit(self)
+        self.search_field.setPlaceholderText("Search")
+        self.search_field.setClearButtonEnabled(True)
+        self.search_field.setFixedHeight(44)
+        self.search_field.textChanged.connect(self._apply_filter)
+
+        font = self.search_field.font()
+        font.setPointSize(16)
+        self.search_field.setFont(font)
+
+        self.arrow_left = QtWidgets.QToolButton(self)
+        self.arrow_left.setArrowType(QtCore.Qt.LeftArrow)
+        self.arrow_left.clicked.connect(self._show_previous_page)
+        self.arrow_left.setToolTip("Previous page")
+        self.arrow_left.setAutoRaise(True)
+        self.arrow_left.setIconSize(QtCore.QSize(32, 32))
+
+        self.arrow_right = QtWidgets.QToolButton(self)
+        self.arrow_right.setArrowType(QtCore.Qt.RightArrow)
+        self.arrow_right.clicked.connect(self._show_next_page)
+        self.arrow_right.setToolTip("Next page")
+        self.arrow_right.setAutoRaise(True)
+        self.arrow_right.setIconSize(QtCore.QSize(32, 32))
+
+        self.pages = QtWidgets.QStackedWidget(self)
+        self.pages.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        self.pagination = PaginationDots(self)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(60, 40, 60, 40)
+        layout.setSpacing(20)
+        layout.addWidget(self.search_field, alignment=QtCore.Qt.AlignHCenter)
+
+        pages_container = QtWidgets.QHBoxLayout()
+        pages_container.setContentsMargins(0, 0, 0, 0)
+        pages_container.setSpacing(20)
+        pages_container.addWidget(self.arrow_left, alignment=QtCore.Qt.AlignVCenter)
+        pages_container.addWidget(self.pages, stretch=1)
+        pages_container.addWidget(self.arrow_right, alignment=QtCore.Qt.AlignVCenter)
+
+        layout.addLayout(pages_container, stretch=1)
+        layout.addWidget(self.pagination, alignment=QtCore.Qt.AlignHCenter)
+
+        self._load_entries_async()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: D401
+        super().showEvent(event)
+        self.background.setGeometry(self.rect())
+        QtCore.QTimer.singleShot(0, self.search_field.setFocus)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401
+        super().resizeEvent(event)
+        self.background.setGeometry(self.rect())
+
+    # Data management -------------------------------------------------
+
+    def _load_entries_async(self) -> None:
+        QtCore.QTimer.singleShot(0, self._load_entries)
+
+    def _load_entries(self) -> None:
+        entries = load_entries()
+        entries = [entry for entry in entries if entry.id not in self._hidden_ids]
+        self._all_entries = entries
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        text = self.search_field.text().strip().lower()
+        if not text:
+            filtered = self._all_entries
+        else:
+            filtered = [entry for entry in self._all_entries if text in entry.name.lower() or text in entry.comment.lower()]
+        self._filtered_entries = filtered
+        self._current_page = 0
+        self._rebuild_pages()
+
+    # Pagination ------------------------------------------------------
+
+    def _rebuild_pages(self) -> None:
+        while self.pages.count():
+            widget = self.pages.widget(0)
+            self.pages.removeWidget(widget)
+            widget.deleteLater()
+
+        for page_entries in chunked(self._filtered_entries, PAGE_SIZE):
+            page_widget = self._create_page(page_entries)
+            self.pages.addWidget(page_widget)
+
+        total_pages = max(1, math.ceil(len(self._filtered_entries) / PAGE_SIZE))
+        self.pagination.set_state(self._current_page, total_pages)
+        self.arrow_left.setEnabled(self._current_page > 0)
+        self.arrow_right.setEnabled(self._current_page < total_pages - 1)
+        if self.pages.count():
+            self.pages.setCurrentIndex(min(self._current_page, self.pages.count() - 1))
+        else:
+            empty_widget = QtWidgets.QLabel("No applications found")
+            empty_widget.setAlignment(QtCore.Qt.AlignCenter)
+            self.pages.addWidget(empty_widget)
+            self.pages.setCurrentWidget(empty_widget)
+        self.pagination.set_state(self._current_page, total_pages)
+
+    def _create_page(self, entries: Sequence[DesktopEntry]) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(widget)
+        grid.setContentsMargins(20, 20, 20, 20)
+        grid.setHorizontalSpacing(30)
+        grid.setVerticalSpacing(20)
+
+        for index, entry in enumerate(entries):
+            row = index // COLUMNS
+            column = index % COLUMNS
+            button = AppIconButton(entry)
+            button.triggered.connect(self._launch_entry)
+            button.request_hide.connect(self._hide_entry)
+            grid.addWidget(button, row, column, alignment=QtCore.Qt.AlignCenter)
+
+        # Fill remaining cells with spacers to maintain layout
+        total_cells = ROWS * COLUMNS
+        for index in range(len(entries), total_cells):
+            row = index // COLUMNS
+            column = index % COLUMNS
+            spacer = QtWidgets.QWidget()
+            spacer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+            grid.addWidget(spacer, row, column)
+
+        return widget
+
+    def _show_previous_page(self) -> None:
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._update_page()
+
+    def _show_next_page(self) -> None:
+        total_pages = max(1, math.ceil(len(self._filtered_entries) / PAGE_SIZE))
+        if self._current_page < total_pages - 1:
+            self._current_page += 1
+            self._update_page()
+
+    def _update_page(self) -> None:
+        self.pages.setCurrentIndex(self._current_page)
+        total_pages = max(1, math.ceil(len(self._filtered_entries) / PAGE_SIZE))
+        self.pagination.set_state(self._current_page, total_pages)
+        self.arrow_left.setEnabled(self._current_page > 0)
+        self.arrow_right.setEnabled(self._current_page < total_pages - 1)
+
+    # Interaction -----------------------------------------------------
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: D401
+        if event.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_PageUp):
+            self._show_previous_page()
+            event.accept()
+            return
+        if event.key() in (QtCore.Qt.Key_Right, QtCore.Qt.Key_PageDown):
+            self._show_next_page()
+            event.accept()
+            return
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _launch_entry(self, entry: DesktopEntry) -> None:
+        launch_entry(entry)
+        self.close()
+
+    def _hide_entry(self, entry: DesktopEntry) -> None:
+        self._hidden_ids.add(entry.id)
+        self._save_hidden_ids()
+        self._apply_filter()
+
+    # Hidden entries --------------------------------------------------
+
+    def _load_hidden_ids(self) -> Set[str]:
+        if HIDDEN_FILE.exists():
+            try:
+                with HIDDEN_FILE.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        return {str(item) for item in data}
+            except (OSError, json.JSONDecodeError):
+                pass
+        return set()
+
+    def _save_hidden_ids(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = sorted(self._hidden_ids)
+        try:
+            with HIDDEN_FILE.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+        except OSError:
+            pass
+
+
+def chunked(items: Iterable[DesktopEntry], size: int) -> Iterable[List[DesktopEntry]]:
+    """Yield chunks of *size* from *items*."""
+
+    chunk: List[DesktopEntry] = []
+    for item in items:
+        chunk.append(item)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def run() -> None:
+    """Entry point for running the Launchpad UI."""
+
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+
+    window = LauncherWindow()
+    window.showFullScreen()
+    window.show()
+    window.raise_()
+    window.activateWindow()
+
+    app.exec_()
