@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from math import ceil
 from pathlib import Path
 from typing import List, Optional, Set
@@ -35,7 +36,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from pynput import keyboard
+try:
+    from Xlib import X, XK, display
+except ImportError:  # pragma: no cover - optional dependency
+    display = None  # type: ignore
+    XK = None  # type: ignore
+    X = None  # type: ignore
 
 from .background import Background
 from .config import Config
@@ -45,36 +51,12 @@ COLUMNS = 7
 ROWS = 5
 ITEMS_PER_PAGE = COLUMNS * ROWS
 
-SUPER_KEY_NAMES = (
-    "cmd",
-    "cmd_l",
-    "cmd_r",
-    "super",
-    "super_l",
-    "super_r",
-    "win",
-    "win_l",
-    "win_r",
+SUPER_KEY_SYMS = (
+    "Super_L",
+    "Super_R",
+    "Meta_L",
+    "Meta_R",
 )
-
-SUPER_VIRTUAL_KEYS = {133, 134, 347}
-
-
-def _collect_super_keys() -> Set[keyboard.Key]:
-    keys: Set[keyboard.Key] = set()
-    members = getattr(keyboard.Key, "__members__", {})
-    for name in SUPER_KEY_NAMES:
-        if name in members:
-            keys.add(members[name])
-        else:
-            try:
-                keys.add(getattr(keyboard.Key, name))
-            except AttributeError:
-                continue
-    return keys
-
-
-SUPER_KEYS = _collect_super_keys()
 
 
 class SuperKeyListener(QObject):
@@ -83,35 +65,125 @@ class SuperKeyListener(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._pressed = False
-        self._listener: Optional[keyboard.Listener] = keyboard.Listener(
-            on_press=self._on_press,
-            on_release=self._on_release,
-            suppress=False,
-        )
-        self._listener.start()
+        self._active = False
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._display = None
+        self._root = None
+        self._keycodes: Set[int] = set()
+
+        if display is None:
+            return
+
+        try:
+            self._display = display.Display()
+            self._root = self._display.screen().root
+        except Exception:
+            self._display = None
+            self._root = None
+            return
+
+        self._install_grabs()
+        if not self._keycodes:
+            self._cleanup_display()
+            return
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._active = True
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
 
     def stop(self) -> None:
-        if self._listener is not None:
-            self._listener.stop()
-            self._listener = None
+        self._stop_event.set()
+        self._active = False
+        self._release_grabs()
+        self._cleanup_display()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
 
-    def _on_press(self, key) -> None:
-        if self._is_super_key(key) and not self._pressed:
-            self._pressed = True
-            self.triggered.emit()
+    def _install_grabs(self) -> None:
+        if self._display is None or self._root is None or XK is None or X is None:
+            return
 
-    def _on_release(self, key) -> None:
-        if self._is_super_key(key):
-            self._pressed = False
+        modifier_masks = self._modifier_combinations()
+
+        for name in SUPER_KEY_SYMS:
+            keysym = XK.string_to_keysym(name)
+            if keysym == 0:
+                continue
+            keycode = self._display.keysym_to_keycode(keysym)
+            if keycode == 0:
+                continue
+            self._keycodes.add(keycode)
+            for mask in modifier_masks:
+                try:
+                    self._root.grab_key(keycode, mask, True, X.GrabModeAsync, X.GrabModeAsync)
+                except Exception:
+                    continue
+        try:
+            self._display.sync()
+        except Exception:
+            pass
+
+    def _release_grabs(self) -> None:
+        if self._display is None or self._root is None or X is None:
+            return
+        for keycode in self._keycodes:
+            for mask in self._modifier_combinations():
+                try:
+                    self._root.ungrab_key(keycode, mask)
+                except Exception:
+                    continue
+        try:
+            self._display.sync()
+        except Exception:
+            pass
+        self._keycodes.clear()
+
+    def _run(self) -> None:
+        if self._display is None or X is None:
+            return
+        while not self._stop_event.is_set():
+            try:
+                event = self._display.next_event()
+            except (OSError, AttributeError):
+                break
+            except Exception:
+                break
+            if event.type == X.KeyPress and event.detail in self._keycodes:
+                if not self._pressed:
+                    self._pressed = True
+                    self.triggered.emit()
+            elif event.type == X.KeyRelease and event.detail in self._keycodes:
+                self._pressed = False
+
+    def _cleanup_display(self) -> None:
+        if self._display is not None:
+            try:
+                self._display.close()
+            except Exception:
+                pass
+        self._display = None
+        self._root = None
 
     @staticmethod
-    def _is_super_key(key) -> bool:
-        if key in SUPER_KEYS:
-            return True
-        virtual_key = getattr(key, "vk", None)
-        if virtual_key in SUPER_VIRTUAL_KEYS:
-            return True
-        return False
+    def _modifier_combinations() -> Set[int]:
+        if X is None:
+            return {0}
+        masks = [0, X.LockMask, X.Mod2Mask, X.Mod5Mask]
+        combos: Set[int] = set()
+        for mask in masks:
+            combos.add(mask)
+        combos.add(X.LockMask | X.Mod2Mask)
+        combos.add(X.LockMask | X.Mod5Mask)
+        combos.add(X.Mod2Mask | X.Mod5Mask)
+        combos.add(X.LockMask | X.Mod2Mask | X.Mod5Mask)
+        combos.add(getattr(X, "AnyModifier", 0))
+        return combos or {0}
 
 
 class SearchField(QLineEdit):
@@ -141,6 +213,8 @@ class LaunchpadWindow(QMainWindow):
         self._build_ui()
         self._load_entries()
         self._apply_background()
+        if not self._super_listener.is_active:
+            self.show_launcher()
 
     def handle_super_key(self) -> None:
         if self.isVisible():

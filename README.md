@@ -17,7 +17,7 @@ Fullscreen application launcher inspired by macOS Launchpad. The launcher is wri
 
 - Python 3.9 or newer
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/intro)
-- [pynput](https://pypi.org/project/pynput/)
+- [python-xlib](https://pypi.org/project/python-xlib/) (for the global Super key listener on X11)
 
 Install dependencies with:
 
@@ -62,3 +62,5 @@ python -m lpad
 ```
 
 The launcher starts in the background. Press the <kbd>Super</kbd>/<kbd>Win</kbd>/<kbd>Mod4</kbd> key to open it fullscreen. Start typing to filter, use the arrows or mouse wheel to change pages, and press <kbd>Esc</kbd> (or the hotkey again) to hide the window.
+
+If the X11 global hotkey cannot be registered (for example on a Wayland-only session or when `python-xlib` is missing), the launcher opens immediately on startup so it remains accessible, and you can still hide/show it manually.
