@@ -228,8 +228,9 @@ class SuperKeyListener(QObject):
 
         modifier_masks = self._modifier_combinations()
 
-        self._previous_error_handler = getattr(self._display, "error_handler", None)
-        self._display.set_error_handler(self._handle_x_error)
+        self._previous_error_handler = self._display.set_error_handler(
+            self._handle_x_error
+        )
 
         try:
             grabbed_any = False
@@ -278,8 +279,9 @@ class SuperKeyListener(QObject):
             or xerror is None
         ):
             return
-        self._previous_error_handler = getattr(self._display, "error_handler", None)
-        self._display.set_error_handler(self._handle_x_error)
+        self._previous_error_handler = self._display.set_error_handler(
+            self._handle_x_error
+        )
         try:
             for keycode in self._keycodes:
                 for mask in self._modifier_combinations():
@@ -348,12 +350,8 @@ class SuperKeyListener(QObject):
     def _restore_error_handler(self) -> None:
         if self._display is None:
             return
-        handler = self._previous_error_handler
-        if handler is None:
-            if xerror is not None:
-                handler = xerror.default_error_handler
-        self._display.set_error_handler(handler)
-        self._previous_error_handler = handler
+        self._display.set_error_handler(self._previous_error_handler)
+        self._previous_error_handler = None
 
 
 class SearchField(QLineEdit):
