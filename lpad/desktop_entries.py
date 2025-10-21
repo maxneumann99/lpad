@@ -8,11 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-DESKTOP_DIRS = [
-    Path("/usr/share/applications"),
-    Path.home() / ".local" / "share" / "applications",
-]
-
 
 @dataclass
 class DesktopEntry:
@@ -71,12 +66,49 @@ def _parse_desktop(path: Path) -> Optional[DesktopEntry]:
     return DesktopEntry(name=name, exec_line=exec_line, icon=icon, desktop_file=path)
 
 
+def _data_dirs() -> List[Path]:
+    data_dirs: List[Path] = []
+
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if data_home:
+        data_dirs.append(Path(data_home))
+    else:
+        data_dirs.append(Path.home() / ".local" / "share")
+
+    data_dirs_env = os.environ.get("XDG_DATA_DIRS")
+    if data_dirs_env:
+        for entry in data_dirs_env.split(":"):
+            if entry:
+                data_dirs.append(Path(entry))
+    else:
+        data_dirs.extend([Path("/usr/local/share"), Path("/usr/share")])
+
+    return data_dirs
+
+
+def _desktop_dirs() -> List[Path]:
+    seen: set[Path] = set()
+    desktop_dirs: List[Path] = []
+    for base_dir in _data_dirs():
+        for subdir in ("applications", "applnk"):
+            candidate = (base_dir / subdir).expanduser()
+            if not candidate.exists():
+                continue
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            desktop_dirs.append(resolved)
+    return desktop_dirs
+
+
 def iter_desktop_entries(hidden: Iterable[str] = ()) -> List[DesktopEntry]:
     hidden_set = {os.path.abspath(h) for h in hidden}
     entries: List[DesktopEntry] = []
-    for base_dir in DESKTOP_DIRS:
-        if not base_dir.exists():
-            continue
+    for base_dir in _desktop_dirs():
         for path in sorted(base_dir.rglob("*.desktop")):
             abs_path = os.path.abspath(path)
             if abs_path in hidden_set:
