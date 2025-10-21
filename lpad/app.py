@@ -3,9 +3,19 @@ from __future__ import annotations
 import sys
 from math import ceil
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from PyQt5.QtCore import QEvent, QEasingCurve, QPointF, QSize, Qt, QTimer, pyqtSignal, QPropertyAnimation
+from PyQt5.QtCore import (
+    QEvent,
+    QEasingCurve,
+    QObject,
+    QPointF,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+    QPropertyAnimation,
+)
 from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPalette
 from PyQt5.QtWidgets import (
     QAction,
@@ -25,6 +35,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from pynput import keyboard
+
 from .background import Background
 from .config import Config
 from .desktop_entries import DesktopEntry, iter_desktop_entries
@@ -32,6 +44,74 @@ from .desktop_entries import DesktopEntry, iter_desktop_entries
 COLUMNS = 7
 ROWS = 5
 ITEMS_PER_PAGE = COLUMNS * ROWS
+
+SUPER_KEY_NAMES = (
+    "cmd",
+    "cmd_l",
+    "cmd_r",
+    "super",
+    "super_l",
+    "super_r",
+    "win",
+    "win_l",
+    "win_r",
+)
+
+SUPER_VIRTUAL_KEYS = {133, 134, 347}
+
+
+def _collect_super_keys() -> Set[keyboard.Key]:
+    keys: Set[keyboard.Key] = set()
+    members = getattr(keyboard.Key, "__members__", {})
+    for name in SUPER_KEY_NAMES:
+        if name in members:
+            keys.add(members[name])
+        else:
+            try:
+                keys.add(getattr(keyboard.Key, name))
+            except AttributeError:
+                continue
+    return keys
+
+
+SUPER_KEYS = _collect_super_keys()
+
+
+class SuperKeyListener(QObject):
+    triggered = pyqtSignal()
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._pressed = False
+        self._listener: Optional[keyboard.Listener] = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+            suppress=False,
+        )
+        self._listener.start()
+
+    def stop(self) -> None:
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+    def _on_press(self, key) -> None:
+        if self._is_super_key(key) and not self._pressed:
+            self._pressed = True
+            self.triggered.emit()
+
+    def _on_release(self, key) -> None:
+        if self._is_super_key(key):
+            self._pressed = False
+
+    @staticmethod
+    def _is_super_key(key) -> bool:
+        if key in SUPER_KEYS:
+            return True
+        virtual_key = getattr(key, "vk", None)
+        if virtual_key in SUPER_VIRTUAL_KEYS:
+            return True
+        return False
 
 
 class SearchField(QLineEdit):
@@ -55,11 +135,27 @@ class LaunchpadWindow(QMainWindow):
         self.config = Config.load()
         self.background = Background(self.config)
 
+        self._super_listener = SuperKeyListener(self)
+        self._super_listener.triggered.connect(self.handle_super_key)
+
         self._build_ui()
         self._load_entries()
         self._apply_background()
 
-        QTimer.singleShot(100, self.search_field.setFocus)
+    def handle_super_key(self) -> None:
+        if self.isVisible():
+            self.hide_launcher()
+        else:
+            self.show_launcher()
+
+    def show_launcher(self) -> None:
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self.search_field.setFocus)
+
+    def hide_launcher(self) -> None:
+        self.hide()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -171,7 +267,7 @@ class LaunchpadWindow(QMainWindow):
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if event.key() == Qt.Key_Escape:
-            self.close()
+            self.hide_launcher()
             return
         if event.key() in (Qt.Key_Left, Qt.Key_PageUp):
             self.grid.navigate(-1)
@@ -180,6 +276,10 @@ class LaunchpadWindow(QMainWindow):
             self.grid.navigate(1)
             return
         super().keyPressEvent(event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._super_listener.stop()
+        super().closeEvent(event)
 
 
 class NavigationButton(QPushButton):
@@ -481,7 +581,6 @@ def main() -> None:
     exit_code = 0
     try:
         window = LaunchpadWindow()
-        window.showFullScreen()
         exit_code = app.exec_()
     except KeyboardInterrupt:
         exit_code = 130

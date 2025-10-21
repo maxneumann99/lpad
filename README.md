@@ -6,8 +6,9 @@ Fullscreen application launcher inspired by macOS Launchpad. The launcher is wri
 
 - Discovers desktop applications from `/usr/share/applications` and `~/.local/share/applications` (including nested folders).
 - Presents applications in a 7×5 grid with smooth page animations and pagination dots.
-- Instant search field focused on startup for keyboard-driven filtering.
-- Keyboard (arrow keys), mouse wheel, on-screen arrows for page navigation, and Escape to exit.
+- Instant search field focused whenever the launcher is shown for keyboard-driven filtering.
+- Launches hidden and toggles fullscreen display with the <kbd>Super</kbd>/<kbd>Win</kbd>/<kbd>Mod4</kbd> key.
+- Keyboard (arrow keys), mouse wheel, on-screen arrows for page navigation, and Escape to hide the launcher.
 - Right-click context menu to hide unwanted launchers, persisted in `~/.config/lpad/conf.json`.
 - Background image configurable via `~/.config/lpad/conf.json`; falls back to desktop wallpaper (GNOME via `gsettings`) or a plain white backdrop.
 - Automatic icon label contrast based on background brightness.
@@ -16,6 +17,7 @@ Fullscreen application launcher inspired by macOS Launchpad. The launcher is wri
 
 - Python 3.9 or newer
 - [PyQt5](https://www.riverbankcomputing.com/software/pyqt/intro)
+- [pynput](https://pypi.org/project/pynput/)
 
 Install dependencies with:
 
@@ -59,4 +61,4 @@ You can also execute it as a module if you prefer:
 python -m lpad
 ```
 
-The window opens fullscreen, showing the first page of applications. Start typing to filter, use the arrows or mouse wheel to change pages, and press <kbd>Esc</kbd> to exit.
+The launcher starts in the background. Press the <kbd>Super</kbd>/<kbd>Win</kbd>/<kbd>Mod4</kbd> key to open it fullscreen. Start typing to filter, use the arrows or mouse wheel to change pages, and press <kbd>Esc</kbd> (or the hotkey again) to hide the window.
