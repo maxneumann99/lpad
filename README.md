@@ -47,7 +47,13 @@ After installation, start the launcher with:
 lpad
 ```
 
-or directly from the source tree:
+or directly from the source tree without installing:
+
+```bash
+python3 main.py
+```
+
+You can also execute it as a module if you prefer:
 
 ```bash
 python -m lpad
