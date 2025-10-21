@@ -191,6 +191,8 @@ class AppGrid(QWidget):
         self.current_page = 0
         self._text_color = "#101010"
 
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
         self.scroll = QScrollArea()
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -198,8 +200,15 @@ class AppGrid(QWidget):
         self.scroll.setWidgetResizable(True)
         self.scroll.viewport().installEventFilter(self)
         self.scroll.installEventFilter(self)
+        self.scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget { background: transparent; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
 
         self.container = QWidget()
+        self.container.setAttribute(Qt.WA_TranslucentBackground)
+        self.container.setAutoFillBackground(False)
         self.container_layout = QHBoxLayout(self.container)
         self.container_layout.setContentsMargins(0, 0, 0, 0)
         self.container_layout.setSpacing(0)
@@ -303,6 +312,8 @@ class AppPage(QWidget):
     def __init__(self, entries: List[DesktopEntry]) -> None:
         super().__init__()
         self.entries = entries
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAutoFillBackground(False)
         self.grid = QGridLayout(self)
         self.grid.setContentsMargins(40, 20, 40, 20)
         self.grid.setHorizontalSpacing(30)
@@ -358,6 +369,7 @@ class AppButton(QToolButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAutoFillBackground(False)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setMinimumSize(120, 140)
         self._update_icon(entry)
