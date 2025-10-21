@@ -117,63 +117,95 @@ def _normalise_path(value: Optional[str]) -> Optional[Path]:
     return None
 
 
-class WallpaperBackground(QtWidgets.QLabel):
-    """Label that displays the configured wallpaper or a fallback color."""
+class WallpaperBackground(QtWidgets.QWidget):
+    """Widget that paints the configured wallpaper or a fallback color."""
 
     backgroundChanged = QtCore.pyqtSignal()
 
     def __init__(self, config: dict, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
-        self.setScaledContents(True)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
-        self.setStyleSheet("background: transparent;")
+        self.setAttribute(QtCore.Qt.WA_NoSystemBackground)
+        self.setAutoFillBackground(False)
         self._config = config
         self._source_pixmap: Optional[QtGui.QPixmap] = None
+        self._scaled_pixmap: Optional[QtGui.QPixmap] = None
+        self._scaled_image: Optional[QtGui.QImage] = None
         self._fallback_color = QtGui.QColor(255, 255, 255)
 
     def refresh_wallpaper(self) -> None:
         path = resolve_background_image(self._config)
+        pixmap: Optional[QtGui.QPixmap]
         if path is not None:
-            pixmap = QtGui.QPixmap(str(path))
-            if pixmap.isNull():
-                pixmap = None
+            loaded = QtGui.QPixmap(str(path))
+            pixmap = loaded if not loaded.isNull() else None
         else:
             pixmap = None
+
         self._source_pixmap = pixmap
-        self._update_background()
+        self._update_scaled_pixmap()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
         super().resizeEvent(event)
-        self._update_background()
+        self._update_scaled_pixmap()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: D401 - inherited docstring
         super().showEvent(event)
         QtCore.QTimer.singleShot(0, self.refresh_wallpaper)
 
-    def _update_background(self) -> None:
-        if not self.size().isValid():
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: D401 - inherited docstring
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+
+        if self._scaled_pixmap is not None and not self._scaled_pixmap.isNull():
+            painter.drawPixmap(0, 0, self._scaled_pixmap)
+        else:
+            painter.fillRect(self.rect(), self._fallback_color)
+
+    def color_at(self, point: QtCore.QPoint) -> QtGui.QColor:
+        """Return the wallpaper colour at ``point`` in widget coordinates."""
+
+        if self._scaled_image is None or self._scaled_image.isNull():
+            return QtGui.QColor(self._fallback_color)
+
+        if not self.rect().contains(point):
+            return QtGui.QColor(self._fallback_color)
+
+        return QtGui.QColor(self._scaled_image.pixel(point))
+
+    def _update_scaled_pixmap(self) -> None:
+        size = self.size()
+        if not size.isValid():
             return
+
+        pixmap: Optional[QtGui.QPixmap]
+        image: Optional[QtGui.QImage]
 
         if self._source_pixmap is not None and not self._source_pixmap.isNull():
             scaled = self._source_pixmap.scaled(
-                self.size(),
+                size,
                 QtCore.Qt.KeepAspectRatioByExpanding,
                 QtCore.Qt.SmoothTransformation,
             )
-            if scaled.size() != self.size():
-                x = max((scaled.width() - self.width()) // 2, 0)
-                y = max((scaled.height() - self.height()) // 2, 0)
-                pixmap = scaled.copy(x, y, self.width(), self.height())
+            if scaled.size() != size:
+                x = max((scaled.width() - size.width()) // 2, 0)
+                y = max((scaled.height() - size.height()) // 2, 0)
+                pixmap = scaled.copy(x, y, size.width(), size.height())
             else:
                 pixmap = scaled
+            image = pixmap.toImage()
         else:
-            pixmap = QtGui.QPixmap(self.size())
+            pixmap = QtGui.QPixmap(size)
             pixmap.fill(self._fallback_color)
+            image = pixmap.toImage()
 
         if pixmap.isNull():
             return
 
-        self.setPixmap(pixmap)
+        self._scaled_pixmap = pixmap
+        self._scaled_image = image
+        self.update()
         self.backgroundChanged.emit()
 
 
@@ -525,17 +557,10 @@ class LauncherWindow(QtWidgets.QWidget):
     # Appearance ------------------------------------------------------
 
     def _update_label_colors(self) -> None:
-        pixmap = self.background.pixmap()
-        if pixmap is None or pixmap.isNull():
-            return
-        image = pixmap.toImage()
         for button in self._buttons:
             center = button.rect().center()
             mapped = button.mapTo(self.background, center)
-            if not image.rect().contains(mapped):
-                button.set_text_color(QtGui.QColor(QtCore.Qt.white))
-                continue
-            color = QtGui.QColor(image.pixel(mapped))
+            color = self.background.color_at(mapped)
             luminance = QtGui.qGray(color.rgb())
             if luminance > 160:
                 button.set_text_color(QtGui.QColor(20, 20, 20))
@@ -572,7 +597,8 @@ def chunked(items: Iterable[DesktopEntry], size: int) -> Iterable[List[DesktopEn
 def run() -> None:
     """Entry point for running the Launchpad UI."""
 
-    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    if QtWidgets.QApplication.instance() is None:
+        QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 
