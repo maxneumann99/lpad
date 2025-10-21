@@ -4,9 +4,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set
+from urllib.parse import unquote, urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -15,6 +18,7 @@ from .desktop_entry import DesktopEntry, load_entries, launch_entry
 APP_NAME = "launchpad"
 _config_root = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CONFIG_DIR = _config_root / APP_NAME
+CONFIG_FILE = CONFIG_DIR / "config.json"
 HIDDEN_FILE = CONFIG_DIR / "hidden.json"
 
 ROWS = 7
@@ -22,21 +26,121 @@ COLUMNS = 5
 PAGE_SIZE = ROWS * COLUMNS
 
 
-class BlurBackground(QtWidgets.QLabel):
-    """Label that displays a blurred snapshot of the desktop."""
+def load_config() -> dict:
+    """Load the launchpad configuration file if it exists."""
+
+    if CONFIG_FILE.exists():
+        try:
+            with CONFIG_FILE.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
+def resolve_background_image(config: dict) -> Optional[Path]:
+    """Determine which image should be used for the background."""
+
+    configured = config.get("background_image") if isinstance(config, dict) else None
+    path = _normalise_path(configured)
+    if path is not None:
+        return path
+
+    detected = detect_current_wallpaper()
+    if detected is not None and detected.exists():
+        return detected
+    return None
+
+
+def detect_current_wallpaper() -> Optional[Path]:
+    """Try to detect the current desktop wallpaper."""
+
+    if shutil.which("gsettings"):
+        for key in ("org.gnome.desktop.background picture-uri-dark", "org.gnome.desktop.background picture-uri"):
+            try:
+                output = subprocess.check_output(
+                    ["gsettings", "get", *key.split()],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+            path = _path_from_gsettings(output)
+            if path is not None and path.exists():
+                return path
+
+    if shutil.which("xfconf-query"):
+        try:
+            output = subprocess.check_output(
+                [
+                    "xfconf-query",
+                    "-c",
+                    "xfce4-desktop",
+                    "-p",
+                    "/backdrop/screen0/monitor0/image-path",
+                ],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            output = ""
+        path = _normalise_path(output.strip())
+        if path is not None:
+            return path
+
+    return None
+
+
+def _path_from_gsettings(value: str) -> Optional[Path]:
+    value = value.strip().strip("\"'")
+    if not value or value.lower() == "none":
+        return None
+
+    parsed = urlparse(value)
+    if parsed.scheme == "file":
+        return _normalise_path(unquote(parsed.path))
+
+    return _normalise_path(value)
+
+
+def _normalise_path(value: Optional[str]) -> Optional[Path]:
+    if not value:
+        return None
+    cleaned = value.strip().strip("\"'")
+    if not cleaned:
+        return None
+    candidate = Path(cleaned).expanduser()
+    if candidate.exists():
+        return candidate
+    return None
+
+
+class WallpaperBackground(QtWidgets.QLabel):
+    """Label that displays the configured wallpaper or a fallback color."""
 
     backgroundChanged = QtCore.pyqtSignal()
 
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+    def __init__(self, config: dict, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent)
         self.setScaledContents(True)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent;")
-        self._blur_effect = QtWidgets.QGraphicsBlurEffect(self)
-        self._blur_effect.setBlurRadius(40)
-        self.setGraphicsEffect(self._blur_effect)
-        self._last_pixmap: Optional[QtGui.QPixmap] = None
-        self._warned_capture = False
+        self._config = config
+        self._source_pixmap: Optional[QtGui.QPixmap] = None
+        self._fallback_color = QtGui.QColor(255, 255, 255)
+
+    def refresh_wallpaper(self) -> None:
+        path = resolve_background_image(self._config)
+        if path is not None:
+            pixmap = QtGui.QPixmap(str(path))
+            if pixmap.isNull():
+                pixmap = None
+        else:
+            pixmap = None
+        self._source_pixmap = pixmap
+        self._update_background()
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: D401 - inherited docstring
         super().resizeEvent(event)
@@ -44,94 +148,33 @@ class BlurBackground(QtWidgets.QLabel):
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: D401 - inherited docstring
         super().showEvent(event)
-        QtCore.QTimer.singleShot(0, self._update_background)
+        QtCore.QTimer.singleShot(0, self.refresh_wallpaper)
 
     def _update_background(self) -> None:
-        if not self.isVisible() or not self.size().isValid():
+        if not self.size().isValid():
             return
 
-        screen = QtWidgets.QApplication.primaryScreen()
-        if screen is None:
-            return
-
-        pixmap: Optional[QtGui.QPixmap] = None
-        if not self._capture_disallowed():
-            try:
-                candidate = screen.grabWindow(0)
-            except RuntimeError:
-                candidate = QtGui.QPixmap()
-
-            if not candidate.isNull():
-                pixmap = candidate
-        else:
-            self._warn_once()
-
-        if pixmap is not None:
-            buffer = self._render_buffer(pixmap)
-            self._last_pixmap = buffer
-        else:
-            buffer = self._fallback_buffer()
-
-        if buffer is None:
-            return
-
-        self.setPixmap(buffer)
-        self.backgroundChanged.emit()
-
-    def _capture_disallowed(self) -> bool:
-        platform_name = (QtGui.QGuiApplication.platformName() or "").lower()
-        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        return "wayland" in platform_name or session_type == "wayland"
-
-    def _warn_once(self) -> None:
-        if self._warned_capture:
-            return
-        self._warned_capture = True
-        QtCore.qWarning("Wallpaper blur disabled: screen capture is not supported on this platform.")
-
-    def _render_buffer(self, pixmap: QtGui.QPixmap) -> Optional[QtGui.QPixmap]:
-        if pixmap.isNull():
-            return None
-
-        scaled = pixmap.scaled(
-            self.size(),
-            QtCore.Qt.KeepAspectRatioByExpanding,
-            QtCore.Qt.SmoothTransformation,
-        )
-
-        if scaled.size() != self.size():
-            x = max((scaled.width() - self.width()) // 2, 0)
-            y = max((scaled.height() - self.height()) // 2, 0)
-            cropped = scaled.copy(x, y, self.width(), self.height())
-        else:
-            cropped = scaled
-
-        buffer = QtGui.QPixmap(self.size())
-        buffer.fill(QtCore.Qt.transparent)
-        painter = QtGui.QPainter(buffer)
-        painter.drawPixmap(0, 0, cropped)
-        painter.fillRect(buffer.rect(), QtGui.QColor(0, 0, 0, 120))
-        painter.end()
-        return buffer
-
-    def _fallback_buffer(self) -> Optional[QtGui.QPixmap]:
-        if self._last_pixmap and not self._last_pixmap.isNull():
-            if self._last_pixmap.size() == self.size():
-                return self._last_pixmap
-            fallback = self._last_pixmap.scaled(
+        if self._source_pixmap is not None and not self._source_pixmap.isNull():
+            scaled = self._source_pixmap.scaled(
                 self.size(),
-                QtCore.Qt.IgnoreAspectRatio,
+                QtCore.Qt.KeepAspectRatioByExpanding,
                 QtCore.Qt.SmoothTransformation,
             )
-            return fallback
+            if scaled.size() != self.size():
+                x = max((scaled.width() - self.width()) // 2, 0)
+                y = max((scaled.height() - self.height()) // 2, 0)
+                pixmap = scaled.copy(x, y, self.width(), self.height())
+            else:
+                pixmap = scaled
+        else:
+            pixmap = QtGui.QPixmap(self.size())
+            pixmap.fill(self._fallback_color)
 
-        fallback = QtGui.QPixmap(self.size())
-        fallback.fill(QtCore.Qt.transparent)
-        painter = QtGui.QPainter(fallback)
-        painter.fillRect(fallback.rect(), QtGui.QColor(0, 0, 0, 160))
-        painter.end()
-        self._last_pixmap = fallback
-        return fallback
+        if pixmap.isNull():
+            return
+
+        self.setPixmap(pixmap)
+        self.backgroundChanged.emit()
 
 
 class AppIconButton(QtWidgets.QToolButton):
@@ -258,8 +301,9 @@ class LauncherWindow(QtWidgets.QWidget):
         self._hidden_ids = self._load_hidden_ids()
         self._current_page = 0
         self._buttons: List[AppIconButton] = []
+        self._config = load_config()
 
-        self.background = BlurBackground(self)
+        self.background = WallpaperBackground(self._config, self)
         self.background.setGeometry(self.rect())
         self.background.lower()
         self.background.backgroundChanged.connect(self._update_label_colors)
