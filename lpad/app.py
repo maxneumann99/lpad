@@ -259,6 +259,7 @@ class AppGrid(QWidget):
             placeholder.show_empty_message("Нет приложений")
             self.pages.append(placeholder)
             self.container_layout.addWidget(placeholder)
+            self._update_page_sizes()
             return
 
         total_pages = ceil(len(self.entries) / ITEMS_PER_PAGE)
@@ -268,6 +269,7 @@ class AppGrid(QWidget):
             page.hide_requested.connect(self.hide_requested.emit)
             self.pages.append(page)
             self.container_layout.addWidget(page)
+        self._update_page_sizes()
 
     def _clear_container(self) -> None:
         while self.container_layout.count():
@@ -295,10 +297,7 @@ class AppGrid(QWidget):
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
-        width = self.scroll.viewport().width()
-        height = self.scroll.viewport().height()
-        for page in self.pages:
-            page.setFixedSize(width, height)
+        self._update_page_sizes()
         self.set_page(self.current_page, animate=False)
 
     def navigate(self, delta: int) -> None:
@@ -308,6 +307,14 @@ class AppGrid(QWidget):
         self._text_color = color
         for page in self.pages:
             page.set_text_color(color)
+
+    def _update_page_sizes(self) -> None:
+        width = self.scroll.viewport().width()
+        height = self.scroll.viewport().height()
+        if width <= 0 or height <= 0:
+            return
+        for page in self.pages:
+            page.setFixedSize(width, height)
 
     def eventFilter(self, obj, event):  # type: ignore[override]
         if event.type() == QEvent.Wheel:
