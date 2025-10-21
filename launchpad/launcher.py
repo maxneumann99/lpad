@@ -260,7 +260,7 @@ class AppIconButton(QtWidgets.QToolButton):
 
     def _apply_stylesheet(self) -> None:
         rgba = (self._text_color.red(), self._text_color.green(), self._text_color.blue(), self._text_color.alpha())
-        self.setStyleSheet(
+        stylesheet = (
             "QToolButton {"
             " background: transparent;"
             f" color: rgba({rgba[0]}, {rgba[1]}, {rgba[2]}, {rgba[3]});"
@@ -275,6 +275,7 @@ class AppIconButton(QtWidgets.QToolButton):
             " border-radius: 12px;"
             "}"
         )
+        self.setStyleSheet(stylesheet)
 
 
 class PaginationDots(QtWidgets.QWidget):
@@ -345,7 +346,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.search_field.setClearButtonEnabled(True)
         self.search_field.setFixedHeight(44)
         self.search_field.textChanged.connect(self._apply_filter)
-        self.search_field.setStyleSheet(
+        search_stylesheet = (
             "QLineEdit {"
             " background: rgba(0, 0, 0, 160);"
             " color: white;"
@@ -355,6 +356,7 @@ class LauncherWindow(QtWidgets.QWidget):
             "}"
             "QLineEdit::placeholder { color: rgba(255, 255, 255, 180); }"
         )
+        self.search_field.setStyleSheet(search_stylesheet)
 
         font = self.search_field.font()
         font.setPointSize(16)
