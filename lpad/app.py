@@ -357,6 +357,7 @@ class AppButton(QToolButton):
         self.setAutoRaise(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setMinimumSize(120, 140)
         self._update_icon(entry)
@@ -389,6 +390,7 @@ class AppButton(QToolButton):
             "font-size: 14px;"
             "border: none;"
             "padding: 8px;"
+            "background-color: transparent;"
             "}"
             "QToolButton::menu-indicator { width: 0; height: 0; }"
         )
