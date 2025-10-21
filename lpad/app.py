@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import sys
 import threading
+from functools import lru_cache
 from math import ceil
 from pathlib import Path
 from typing import List, Optional, Set
@@ -45,11 +47,116 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from .background import Background
 from .config import Config
-from .desktop_entries import DesktopEntry, iter_desktop_entries
+from .desktop_entries import DesktopEntry, data_dirs, iter_desktop_entries
 
 COLUMNS = 7
 ROWS = 5
 ITEMS_PER_PAGE = COLUMNS * ROWS
+
+ICON_EXTENSIONS = (".png", ".svg", ".xpm")
+
+
+def _resolve_path(path: Path) -> Optional[Path]:
+    try:
+        return path.resolve(strict=True)
+    except OSError:
+        return None
+
+
+@lru_cache()
+def _icon_theme_roots() -> tuple[Path, ...]:
+    seen: Set[Path] = set()
+    roots: List[Path] = []
+
+    for base in data_dirs():
+        candidate = (base / "icons").expanduser()
+        if not candidate.is_dir():
+            continue
+        resolved = _resolve_path(candidate)
+        if not resolved or resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+
+    home_icons = Path.home() / ".icons"
+    if home_icons.is_dir():
+        resolved = _resolve_path(home_icons)
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            roots.append(resolved)
+
+    return tuple(roots)
+
+
+@lru_cache()
+def _icon_file_roots() -> tuple[Path, ...]:
+    roots = list(_icon_theme_roots())
+    seen: Set[Path] = set(roots)
+
+    for base in data_dirs():
+        candidate = (base / "pixmaps").expanduser()
+        if not candidate.is_dir():
+            continue
+        resolved = _resolve_path(candidate)
+        if not resolved or resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+
+    return tuple(roots)
+
+
+def _ensure_icon_theme_paths() -> None:
+    current_paths = []
+    seen: Set[Path] = set()
+    for existing in QIcon.themeSearchPaths():
+        path = Path(existing)
+        resolved = _resolve_path(path) if path.exists() else None
+        if resolved and resolved not in seen:
+            seen.add(resolved)
+            current_paths.append(str(resolved))
+
+    updated = False
+    for root in _icon_theme_roots():
+        if root in seen:
+            continue
+        seen.add(root)
+        current_paths.append(str(root))
+        updated = True
+
+    if updated:
+        QIcon.setThemeSearchPaths(current_paths)
+
+    if not QIcon.themeName():
+        theme = os.environ.get("XDG_ICON_THEME") or "hicolor"
+        QIcon.setThemeName(theme)
+
+
+@lru_cache(maxsize=256)
+def _find_icon_file(name: str) -> Optional[Path]:
+    raw = Path(name)
+    if raw.is_absolute():
+        return raw if raw.exists() else None
+
+    candidates: List[str] = []
+    if raw.suffix:
+        candidates.append(name)
+    else:
+        candidates.append(name)
+        candidates.extend(f"{name}{ext}" for ext in ICON_EXTENSIONS)
+
+    for root in _icon_file_roots():
+        for candidate in candidates:
+            candidate_path = (root / candidate).expanduser()
+            if candidate_path.exists():
+                return candidate_path
+
+        if "/" not in name and not raw.suffix:
+            for ext in ICON_EXTENSIONS:
+                for match in root.rglob(f"{name}{ext}"):
+                    return match
+
+    return None
 
 SUPER_KEY_SYMS = (
     "Super_L",
@@ -585,13 +692,32 @@ class AppButton(QToolButton):
     def _update_icon(self, entry: DesktopEntry) -> None:
         icon: Optional[QIcon] = None
         if entry.icon:
-            icon_path = Path(entry.icon)
-            if icon_path.exists():
-                icon = QIcon(str(icon_path))
-                if icon.isNull():
-                    icon = None
-            if icon is None or icon.isNull():
-                icon = QIcon.fromTheme(entry.icon)
+            raw_path = Path(entry.icon)
+            candidate_paths = []
+            if raw_path.is_absolute():
+                candidate_paths.append(raw_path)
+            else:
+                candidate_paths.append((entry.desktop_file.parent / raw_path).expanduser())
+                candidate_paths.append(raw_path.expanduser())
+
+            for candidate in candidate_paths:
+                if not candidate.exists():
+                    continue
+                icon = QIcon(str(candidate))
+                if icon and not icon.isNull():
+                    break
+                icon = None
+
+            if not icon or icon.isNull():
+                _ensure_icon_theme_paths()
+                themed_icon = QIcon.fromTheme(entry.icon)
+                if themed_icon and not themed_icon.isNull():
+                    icon = themed_icon
+
+            if (not icon or icon.isNull()) and not raw_path.is_absolute():
+                fallback_path = _find_icon_file(entry.icon)
+                if fallback_path:
+                    icon = QIcon(str(fallback_path))
         if not icon or icon.isNull():
             icon = QApplication.style().standardIcon(QApplication.style().SP_FileIcon)
         self.setIcon(icon)

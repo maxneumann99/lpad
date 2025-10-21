@@ -86,6 +86,11 @@ def _data_dirs() -> List[Path]:
     return data_dirs
 
 
+def data_dirs() -> List[Path]:
+    """Expose the resolved XDG data directories for other modules."""
+    return list(_data_dirs())
+
+
 def _desktop_dirs() -> List[Path]:
     seen: set[Path] = set()
     desktop_dirs: List[Path] = []
