@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PyQt5.QtCore import QEvent, QEasingCurve, QPointF, QSize, Qt, QTimer, pyqtSignal, QPropertyAnimation
-from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPalette
+from PyQt5.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QKeySequence
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QToolButton,
+    QShortcut,
     QVBoxLayout,
     QWidget,
 )
@@ -88,6 +89,11 @@ class LaunchpadWindow(QMainWindow):
 
         self.pagination = PaginationDots()
         main_layout.addWidget(self.pagination, alignment=Qt.AlignHCenter)
+
+        self._left_shortcut = QShortcut(QKeySequence(Qt.Key_Left), self)
+        self._left_shortcut.activated.connect(lambda: self.grid.navigate(-1))
+        self._right_shortcut = QShortcut(QKeySequence(Qt.Key_Right), self)
+        self._right_shortcut.activated.connect(lambda: self.grid.navigate(1))
 
     def _load_entries(self) -> None:
         self.entries = iter_desktop_entries(hidden=self.config.hidden)
