@@ -107,7 +107,7 @@ class AppIconButton(QtWidgets.QToolButton):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: D401
         if event.button() == QtCore.Qt.RightButton:
             menu = QtWidgets.QMenu(self)
-            hide_action = menu.addAction("Hide")
+            hide_action = menu.addAction("Скрыть")
             action = menu.exec_(self.mapToGlobal(event.pos()))
             if action == hide_action:
                 self.request_hide.emit(self.entry)
@@ -394,6 +394,7 @@ class LauncherWindow(QtWidgets.QWidget):
 
     def _hide_entry(self, entry: DesktopEntry) -> None:
         self._hidden_ids.add(entry.id)
+        self._all_entries = [item for item in self._all_entries if item.id != entry.id]
         self._save_hidden_ids()
         self._apply_filter()
 
