@@ -1343,7 +1343,12 @@ class SlidingStackedWidget(QStackedWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setStackingMode(QStackedLayout.StackAll)
+        if hasattr(QStackedWidget, "setStackingMode"):
+            QStackedWidget.setStackingMode(self, QStackedLayout.StackAll)
+        else:
+            layout = self.layout()
+            if isinstance(layout, QStackedLayout):
+                layout.setStackingMode(QStackedLayout.StackAll)
         self._animation: QParallelAnimationGroup | None = None
         self._pending_index: int | None = None
         self._animation_duration = 280
