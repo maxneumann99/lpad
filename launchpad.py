@@ -332,7 +332,7 @@ class LaunchpadWindow(QWidget):
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
         self._stack = QStackedWidget()
-        self._stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._stack.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
 
         self._search_field = QLineEdit()
         self._search_field.setPlaceholderText("Поиск приложений")
@@ -370,7 +370,8 @@ class LaunchpadWindow(QWidget):
 
         content_layout = QHBoxLayout()
         content_layout.addWidget(left_button, alignment=Qt.AlignVCenter)
-        content_layout.addWidget(self._stack, stretch=1, alignment=Qt.AlignTop)
+        content_layout.addWidget(self._stack, alignment=Qt.AlignTop | Qt.AlignLeft)
+        content_layout.addStretch(1)
         content_layout.addWidget(right_button, alignment=Qt.AlignVCenter)
 
         main_layout = QVBoxLayout(self)
@@ -424,7 +425,10 @@ class LaunchpadWindow(QWidget):
             page_layout.setContentsMargins(40, 40, 40, 40)
             page_layout.setSpacing(0)
 
-            grid = QGridLayout()
+            grid_container = QWidget()
+            grid_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+            grid = QGridLayout(grid_container)
             grid.setContentsMargins(0, 0, 0, 0)
             grid.setHorizontalSpacing(30)
             grid.setVerticalSpacing(30)
@@ -436,7 +440,7 @@ class LaunchpadWindow(QWidget):
                 grid.addWidget(button, row, column)
 
             grid.setRowStretch(APP_ROWS, 1)
-            page_layout.addLayout(grid)
+            page_layout.addWidget(grid_container, alignment=Qt.AlignTop | Qt.AlignLeft)
             page_layout.addStretch(1)
 
             self._stack.addWidget(page_widget)
