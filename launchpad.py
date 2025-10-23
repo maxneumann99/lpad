@@ -18,13 +18,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QEvent, QTimer
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -331,7 +332,27 @@ class LaunchpadWindow(QWidget):
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
         self._stack = QStackedWidget()
 
-        self._create_pages()
+        self._search_field = QLineEdit()
+        self._search_field.setPlaceholderText("Поиск приложений")
+        self._search_field.setClearButtonEnabled(True)
+        self._search_field.setFixedHeight(40)
+        self._search_field.setMaximumWidth(APP_TILE_WIDTH * APP_COLUMNS)
+        self._search_field.setStyleSheet(
+            "QLineEdit {"
+            " padding: 0 18px;"
+            " border-radius: 20px;"
+            " border: 1px solid rgba(0, 0, 0, 80);"
+            " background-color: rgba(255, 255, 255, 200);"
+            " color: black;"
+            " font-size: 16px;"
+            "}"
+            "QLineEdit:focus { border-color: rgba(64, 128, 255, 160); }"
+        )
+        self._search_field.textChanged.connect(self._on_search_text_changed)
+        self._search_field.installEventFilter(self)
+
+        self._filtered_apps: List[Application] = list(apps)
+        self._rebuild_pages()
 
         left_button = QPushButton("◀")
         right_button = QPushButton("▶")
@@ -353,17 +374,49 @@ class LaunchpadWindow(QWidget):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(60, 60, 60, 40)
         main_layout.setSpacing(20)
+        main_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
         main_layout.addStretch()
         main_layout.addLayout(content_layout)
         main_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
         main_layout.addStretch()
 
         self._update_page_indicator()
-        self.setFocus()
+        QTimer.singleShot(0, self._search_field.setFocus)
 
-    def _create_pages(self) -> None:
-        for index in range(0, len(self._apps), APPS_PER_PAGE):
-            page_apps = self._apps[index : index + APPS_PER_PAGE]
+    def eventFilter(self, obj, event):
+        if obj is self._search_field and event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key == Qt.Key_Escape:
+                self.close()
+                return True
+            if event.modifiers() == Qt.NoModifier and key in (Qt.Key_Right, Qt.Key_Down):
+                self.next_page()
+                return True
+            if event.modifiers() == Qt.NoModifier and key in (Qt.Key_Left, Qt.Key_Up):
+                self.previous_page()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _clear_pages(self) -> None:
+        while self._stack.count():
+            widget = self._stack.widget(0)
+            self._stack.removeWidget(widget)
+            widget.deleteLater()
+
+    def _rebuild_pages(self) -> None:
+        self._clear_pages()
+        apps = self._filtered_apps
+        empty_text = "Нет установленных приложений"
+        if self._apps and not apps:
+            empty_text = "Ничего не найдено"
+        self._create_pages(apps, empty_text)
+        if self._stack.count() > 0:
+            self._stack.setCurrentIndex(0)
+        self._update_page_indicator()
+
+    def _create_pages(self, apps: List[Application], empty_text: str) -> None:
+        for index in range(0, len(apps), APPS_PER_PAGE):
+            page_apps = apps[index : index + APPS_PER_PAGE]
             page_widget = QWidget()
             grid = QGridLayout(page_widget)
             grid.setContentsMargins(40, 40, 40, 40)
@@ -389,7 +442,7 @@ class LaunchpadWindow(QWidget):
 
         if self._stack.count() == 0:
             empty_widget = QWidget()
-            message = QLabel("No applications found")
+            message = QLabel(empty_text)
             message.setAlignment(Qt.AlignCenter)
             layout = QVBoxLayout(empty_widget)
             layout.addWidget(message)
@@ -426,6 +479,8 @@ class LaunchpadWindow(QWidget):
             self.previous_page()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if self._handle_search_key(event):
+            return
         if event.key() in (Qt.Key_Right, Qt.Key_Down):
             self.next_page()
         elif event.key() in (Qt.Key_Left, Qt.Key_Up):
@@ -434,6 +489,42 @@ class LaunchpadWindow(QWidget):
             self.close()
         else:
             super().keyPressEvent(event)
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
+            self.close()
+
+    def _handle_search_key(self, event) -> bool:
+        modifiers = event.modifiers()
+        if modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return False
+
+        key = event.key()
+        if key == Qt.Key_Backspace:
+            self._search_field.setFocus()
+            self._search_field.backspace()
+            return True
+        if key == Qt.Key_Delete:
+            self._search_field.setFocus()
+            self._search_field.del_()
+            return True
+
+        text = event.text()
+        if text and (text.isprintable() or text == " "):
+            self._search_field.setFocus()
+            self._search_field.insert(text)
+            return True
+
+        return False
+
+    def _on_search_text_changed(self, text: str) -> None:
+        query = text.strip().lower()
+        if not query:
+            self._filtered_apps = list(self._apps)
+        else:
+            self._filtered_apps = [app for app in self._apps if query in app.name.lower()]
+        self._rebuild_pages()
 
     def _update_page_indicator(self) -> None:
         self._page_indicator.set_page_count(self._stack.count())
