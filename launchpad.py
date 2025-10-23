@@ -184,35 +184,53 @@ class PageIndicator(QWidget):
         super().__init__(parent)
         self._page_count = page_count
         self._current_page = 0
+        self._dot_diameter = 6
+        self._dot_spacing = 16
         self.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.setFixedHeight(20)
 
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        visible_dots = max(1, self._page_count)
+        width = visible_dots * self._dot_diameter
+        width += max(0, visible_dots - 1) * self._dot_spacing
+        width += 12  # Provide side padding so the dots do not touch the edges.
+        return QSize(width, 20)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return self.sizeHint()
+
     def set_page_count(self, count: int) -> None:
         self._page_count = count
+        self.updateGeometry()
         self.update()
 
     def set_current_page(self, index: int) -> None:
-        self._current_page = index
+        if self._page_count:
+            self._current_page = max(0, min(index, self._page_count - 1))
+        else:
+            self._current_page = 0
         self.update()
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        radius = 6
-        spacing = 16
-        total_width = max(0, (self._page_count - 1) * spacing)
+        dot_diameter = self._dot_diameter
+        spacing = self._dot_spacing
+        visible_dots = max(1, self._page_count)
+        active_index = self._current_page if self._page_count else 0
+        total_width = dot_diameter + max(0, visible_dots - 1) * spacing
         start_x = (self.width() - total_width) // 2
-        y = self.height() // 2
+        y = (self.height() - dot_diameter) // 2
 
         active_color = QColor(45, 45, 45)
         inactive_color = QColor(210, 210, 210)
 
-        for index in range(self._page_count):
-            color = active_color if index == self._current_page else inactive_color
+        for index in range(visible_dots):
+            color = active_color if index == active_index else inactive_color
             painter.setBrush(color)
             painter.setPen(Qt.NoPen)
             x = start_x + index * spacing
-            painter.drawEllipse(x, y - radius // 2, radius, radius)
+            painter.drawEllipse(x, y, dot_diameter, dot_diameter)
 
 
 class ApplicationButton(QToolButton):
