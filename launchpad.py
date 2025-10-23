@@ -81,8 +81,20 @@ DEFAULT_FOLDER_NAME = "Папка"
 _ICON_CACHE: dict[str, Path | None] = {}
 _ICON_SEARCH_ROOTS: list[Path] | None = None
 _ICON_INDEXED_ROOTS: set[Path] = set()
+_ICON_ROOT_DIRECTORIES: dict[Path, list[Path]] = {}
 _ICON_FILE_INDEX: dict[str, Path] = {}
 _ICON_EXTENSIONS = (".png", ".svg", ".xpm")
+
+_DEFAULT_ICON_SUBDIRS = (
+    "apps",
+    "actions",
+    "categories",
+    "devices",
+    "emblems",
+    "mimetypes",
+    "places",
+    "status",
+)
 
 
 def _icon_search_roots() -> list[Path]:
@@ -144,6 +156,38 @@ def _register_icon_path(root: Path, icon_path: Path) -> None:
                 _ICON_FILE_INDEX.setdefault(rel_base, icon_path)
 
 
+def _parse_icon_theme_directories(theme_root: Path) -> list[Path]:
+    """Return candidate subdirectories listed by ``index.theme`` if present."""
+
+    index_path = theme_root / "index.theme"
+    try:
+        if not index_path.exists():
+            return []
+    except OSError:
+        return []
+
+    parser = configparser.ConfigParser()
+    try:
+        with index_path.open("r", encoding="utf-8", errors="replace") as fh:
+            parser.read_file(fh)
+    except (OSError, configparser.Error):
+        return []
+
+    directories_value = parser.get("Icon Theme", "Directories", fallback="")
+    if not directories_value:
+        return []
+
+    entries = re.split(r"[;,]", directories_value)
+    candidates: list[Path] = []
+    for entry in entries:
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        candidate = (theme_root / cleaned).resolve()
+        candidates.append(candidate)
+    return candidates
+
+
 def _ensure_icon_index_for_root(root: Path) -> None:
     """Populate the icon index for the provided ``root`` directory."""
 
@@ -153,24 +197,100 @@ def _ensure_icon_index_for_root(root: Path) -> None:
 
     try:
         if not root.exists():
+            _ICON_ROOT_DIRECTORIES[root] = []
             return
     except OSError:
+        _ICON_ROOT_DIRECTORIES[root] = []
         return
 
     try:
         if root.is_file():
             _register_icon_path(root.parent, root)
+            _ICON_ROOT_DIRECTORIES[root] = []
             return
     except OSError:
+        _ICON_ROOT_DIRECTORIES[root] = []
         return
 
+    directories: list[Path] = []
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            if path.exists():
+                directories.append(path)
+        except OSError:
+            return
+
+    _add_candidate(root)
+
     try:
-        for path in root.rglob("*"):
-            if not path.is_file():
+        for child in root.iterdir():
+            if child.is_file():
+                _register_icon_path(root, child)
                 continue
-            _register_icon_path(root, path)
+            if not child.is_dir():
+                continue
+            _add_candidate(child)
+            for candidate in _parse_icon_theme_directories(child):
+                _add_candidate(candidate)
+            for subdir in _DEFAULT_ICON_SUBDIRS:
+                _add_candidate(child / subdir)
     except OSError:
-        return
+        pass
+
+    for candidate in _parse_icon_theme_directories(root):
+        _add_candidate(candidate)
+
+    for subdir in _DEFAULT_ICON_SUBDIRS:
+        _add_candidate(root / subdir)
+
+    # De-duplicate while preserving order
+    seen: set[Path] = set()
+    unique_directories: list[Path] = []
+    for directory in directories:
+        resolved = directory
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_directories.append(directory)
+
+    _ICON_ROOT_DIRECTORIES[root] = unique_directories
+
+
+def _locate_icon_in_root(root: Path, key: str) -> Path | None:
+    """Return a matching icon path inside ``root`` for ``key`` if available."""
+
+    try:
+        key_path = Path(key)
+    except OSError:
+        key_path = None
+
+    if key_path and key_path.is_absolute():
+        try:
+            if key_path.exists():
+                return key_path
+        except OSError:
+            return None
+        return None
+
+    # Allow icon names that already include theme-relative directories
+    if key_path and len(key_path.parts) > 1:
+        candidate = root / key_path
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            pass
+
+    for directory in _ICON_ROOT_DIRECTORIES.get(root, []):
+        try:
+            candidate = directory / key
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+
+    return None
 
 
 def _icon_search_keys(icon_name: str) -> list[str]:
@@ -217,18 +337,41 @@ def _find_icon_in_filesystem(icon_name: str) -> Path | None:
     if not normalized:
         return None
 
+    try:
+        absolute_candidate = Path(normalized)
+        if absolute_candidate.is_absolute():
+            if absolute_candidate.exists():
+                _ICON_CACHE[normalized] = absolute_candidate
+                _register_icon_path(absolute_candidate.parent, absolute_candidate)
+                return absolute_candidate
+            _ICON_CACHE[normalized] = None
+            return None
+    except OSError:
+        pass
+
     cached = _ICON_CACHE.get(normalized)
     if normalized in _ICON_CACHE:
         return cached
 
     search_keys = _icon_search_keys(normalized)
-    for root in _icon_search_roots():
-        _ensure_icon_index_for_root(root)
-        for key in search_keys:
-            icon_path = _ICON_FILE_INDEX.get(key)
+    for key in search_keys:
+        icon_path = _ICON_FILE_INDEX.get(key)
+        try:
             if icon_path and icon_path.exists():
                 _ICON_CACHE[normalized] = icon_path
                 return icon_path
+        except OSError:
+            continue
+
+    for root in _icon_search_roots():
+        _ensure_icon_index_for_root(root)
+        for key in search_keys:
+            icon_path = _locate_icon_in_root(root, key)
+            if icon_path is None:
+                continue
+            _register_icon_path(root, icon_path)
+            _ICON_CACHE[normalized] = icon_path
+            return icon_path
 
     _ICON_CACHE[normalized] = None
     return None
