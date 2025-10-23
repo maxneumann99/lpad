@@ -1846,7 +1846,7 @@ class LaunchpadWindow(QWidget):
         self._search_field.installEventFilter(self)
 
         self._filtered_items: List[LayoutItem] = []
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=0)
 
         left_button = QPushButton("◀")
         right_button = QPushButton("▶")
@@ -2024,15 +2024,20 @@ class LaunchpadWindow(QWidget):
             self._stack.removeWidget(widget)
             widget.deleteLater()
 
-    def _rebuild_pages(self) -> None:
+    def _rebuild_pages(self, preferred_page: int | None = None) -> None:
+        current_index = self._stack.currentIndex()
         self._clear_pages()
         items = self._filtered_items
         empty_text = "Нет установленных приложений"
         if self._all_apps and not items:
             empty_text = "Ничего не найдено"
         self._create_pages(items, empty_text)
-        if self._stack.count() > 0:
-            self._stack.setCurrentIndex(0)
+        page_count = self._stack.count()
+        if page_count > 0:
+            if preferred_page is None:
+                preferred_page = current_index if current_index >= 0 else 0
+            preferred_page = max(0, min(preferred_page, page_count - 1))
+            self._stack.setCurrentIndex(preferred_page)
         self._update_page_indicator()
 
     def _create_pages(self, items: List[LayoutItem], empty_text: str) -> None:
@@ -2207,13 +2212,13 @@ class LaunchpadWindow(QWidget):
 
     def _on_search_text_changed(self, text: str) -> None:
         self._search_query = text.strip().lower()
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=0)
 
     def _update_page_indicator(self, _index: int | None = None) -> None:
         self._page_indicator.set_page_count(self._stack.count())
         self._page_indicator.set_current_page(self._stack.currentIndex())
 
-    def _update_filtered_items(self) -> None:
+    def _update_filtered_items(self, preferred_page: int | None = None) -> None:
         if not self._search_query:
             self._filtered_items = list(self._layout_items)
         else:
@@ -2224,7 +2229,7 @@ class LaunchpadWindow(QWidget):
                 if str(app.desktop_file) not in self._hidden_paths
                 and query in app.name.lower()
             ]
-        self._rebuild_pages()
+        self._rebuild_pages(preferred_page)
 
     def _remove_app_from_layout(self, desktop_path: str) -> bool:
         removed = False
@@ -2274,7 +2279,7 @@ class LaunchpadWindow(QWidget):
             _save_layout(self._layout_items)
 
         if added_to_hidden or removed:
-            self._update_filtered_items()
+            self._update_filtered_items(preferred_page=self._stack.currentIndex())
 
     def _on_reorder_requested(self, source_key: str, target_key: str, insert_before: bool) -> None:
         if source_key == target_key:
@@ -2299,7 +2304,7 @@ class LaunchpadWindow(QWidget):
         _save_layout(self._layout_items)
 
         if self._search_query:
-            self._update_filtered_items()
+            self._update_filtered_items(preferred_page=0)
             return
 
         self._filtered_items = list(self._layout_items)
@@ -2307,7 +2312,7 @@ class LaunchpadWindow(QWidget):
             source_key, target_key, insert_before
         ):
             return
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=self._stack.currentIndex())
 
     def _grid_height_budget(self) -> int:
         layout = self.layout()
@@ -2397,7 +2402,7 @@ class LaunchpadWindow(QWidget):
             return
 
         _save_layout(self._layout_items)
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=self._stack.currentIndex())
 
     def _on_folder_button_clicked(self, folder_id: str, anchor_rect: QRect) -> None:
         folder = self._find_folder(folder_id)
