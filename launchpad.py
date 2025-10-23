@@ -573,7 +573,7 @@ class FolderButton(LaunchpadTileButton):
         super().__init__(parent)
         self._folder = folder
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        self.setIcon(self._folder_icon())
+        self._update_icon()
         self.setIconSize(QSize(64, 64))
         self.setAutoRaise(False)
         self.setCursor(Qt.PointingHandCursor)
@@ -587,12 +587,49 @@ class FolderButton(LaunchpadTileButton):
         self.setText(self._format_label(folder.name))
         self.clicked.connect(self._on_clicked)
 
-    @staticmethod
-    def _folder_icon() -> QIcon:
-        icon = QIcon.fromTheme("folder")
-        if not icon.isNull():
-            return icon
-        return QApplication.style().standardIcon(QApplication.style().SP_DirClosedIcon)
+    def _update_icon(self) -> None:
+        previews = self._folder.apps[:4]
+        if not previews:
+            fallback = QIcon.fromTheme("folder")
+            if fallback.isNull():
+                fallback = QApplication.style().standardIcon(QApplication.style().SP_DirClosedIcon)
+            self.setIcon(fallback)
+            return
+
+        base_size = 96
+        pixmap = QPixmap(base_size, base_size)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = QRect(4, 4, base_size - 8, base_size - 8)
+        painter.setPen(QColor(255, 255, 255, 80))
+        painter.setBrush(QColor(40, 40, 40, 230))
+        painter.drawRoundedRect(rect, 18, 18)
+
+        inner_margin = 14
+        spacing = 8
+        inner = rect.adjusted(inner_margin, inner_margin, -inner_margin, -inner_margin)
+        cell_width = max(1, (inner.width() - spacing) // 2)
+        cell_height = max(1, (inner.height() - spacing) // 2)
+        icon_size = min(cell_width, cell_height)
+        offset_x = inner.left() + (inner.width() - (icon_size * 2 + spacing)) // 2
+        offset_y = inner.top() + (inner.height() - (icon_size * 2 + spacing)) // 2
+
+        for index, app in enumerate(previews):
+            icon = ApplicationButton._create_icon(app.icon_name)
+            tile = icon.pixmap(icon_size, icon_size)
+            if tile.isNull():
+                continue
+            row = index // 2
+            column = index % 2
+            x = offset_x + column * (icon_size + spacing)
+            y = offset_y + row * (icon_size + spacing)
+            painter.drawPixmap(x, y, icon_size, icon_size, tile)
+
+        painter.end()
+        self.setIcon(QIcon(pixmap))
 
     def set_folder_name(self, name: str) -> None:
         self._folder.name = name
@@ -600,6 +637,7 @@ class FolderButton(LaunchpadTileButton):
 
     def set_folder_apps(self, apps: List[Application]) -> None:
         self._folder.apps = apps
+        self._update_icon()
 
     def _on_clicked(self) -> None:
         rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
