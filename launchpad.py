@@ -316,8 +316,6 @@ class PageIndicator(QWidget):
 class ApplicationButton(QToolButton):
     """Button representing a single application entry."""
 
-    reorder_requested = pyqtSignal(str, str, bool)
-
     def __init__(self, app: Application, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._app = app
@@ -337,7 +335,7 @@ class ApplicationButton(QToolButton):
         )
         self.setText(self._format_label(app.name))
         self.clicked.connect(self._on_clicked)
-        self.setAcceptDrops(True)
+        self.setAcceptDrops(False)
 
     @staticmethod
     def _create_icon(icon_name: str) -> QIcon:
@@ -392,28 +390,11 @@ class ApplicationButton(QToolButton):
         super().mouseReleaseEvent(event)
         self._drag_start_pos = None
 
-    def dragEnterEvent(self, event):  # type: ignore[override]
-        if event.mimeData().hasFormat("application/x-launchpad-app"):
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
+    @property
+    def desktop_path(self) -> str:
+        """Return the full path to the desktop file represented by the button."""
 
-    def dragMoveEvent(self, event):  # type: ignore[override]
-        if event.mimeData().hasFormat("application/x-launchpad-app"):
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event):  # type: ignore[override]
-        if not event.mimeData().hasFormat("application/x-launchpad-app"):
-            super().dropEvent(event)
-            return
-        source_path = bytes(event.mimeData().data("application/x-launchpad-app")).decode("utf-8")
-        target_path = str(self._app.desktop_file)
-        if source_path and source_path != target_path:
-            insert_before = event.pos().x() < (self.width() // 2)
-            self.reorder_requested.emit(source_path, target_path, insert_before)
-        event.acceptProposedAction()
+        return str(self._app.desktop_file)
 
     def _format_label(self, text: str) -> str:
         """Return the button label wrapped to fit within the tile width."""
@@ -459,6 +440,119 @@ class ApplicationButton(QToolButton):
             lines.append("")
 
         return "\n".join(lines)
+
+
+class ApplicationGridWidget(QWidget):
+    """Container widget responsible for handling drag-and-drop reordering."""
+
+    reorder_requested = pyqtSignal(str, str, bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(GRID_HORIZONTAL_SPACING)
+        self._grid.setVerticalSpacing(GRID_VERTICAL_SPACING)
+        self._grid.setColumnStretch(APP_COLUMNS, 1)
+        self._grid.setRowStretch(APP_ROWS, 1)
+        self._buttons: list[ApplicationButton] = []
+        self.setAcceptDrops(True)
+
+    def add_button(self, button: ApplicationButton, row: int, column: int) -> None:
+        """Add an application button to the grid at the specified position."""
+
+        self._grid.addWidget(button, row, column)
+        self._buttons.append(button)
+
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-launchpad-app"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-launchpad-app"):
+            super().dragMoveEvent(event)
+            return
+        if self._determine_drop_target(event.pos()) is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-launchpad-app"):
+            super().dropEvent(event)
+            return
+
+        target = self._determine_drop_target(event.pos())
+        if target is None:
+            event.ignore()
+            return
+
+        target_button, insert_before = target
+        source_path = bytes(event.mimeData().data("application/x-launchpad-app")).decode("utf-8")
+        target_path = target_button.desktop_path
+        if source_path and source_path != target_path:
+            self.reorder_requested.emit(source_path, target_path, insert_before)
+        event.acceptProposedAction()
+
+    def _determine_drop_target(
+        self, position: QPoint
+    ) -> tuple[ApplicationButton, bool] | None:
+        """Return the drop target button and placement side for the position."""
+
+        buttons = [button for button in self._buttons if button.isVisible()]
+        if not buttons:
+            return None
+
+        vertical_padding = max(1, GRID_VERTICAL_SPACING // 2)
+
+        first_rect = buttons[0].geometry()
+        if position.y() < first_rect.top() - vertical_padding:
+            return buttons[0], True
+
+        last_rect = buttons[-1].geometry()
+        if position.y() > last_rect.bottom() + vertical_padding:
+            return buttons[-1], False
+
+        rows: list[list[ApplicationButton]] = []
+        for index, button in enumerate(buttons):
+            row_index = index // APP_COLUMNS
+            if row_index >= len(rows):
+                rows.append([])
+            rows[row_index].append(button)
+
+        for row_buttons in rows:
+            row_top = min(btn.geometry().top() for btn in row_buttons) - vertical_padding
+            row_bottom = max(btn.geometry().bottom() for btn in row_buttons) + vertical_padding
+
+            if position.y() < row_top:
+                return row_buttons[0], True
+            if position.y() > row_bottom:
+                continue
+
+            first_rect = row_buttons[0].geometry()
+            if position.x() < first_rect.left():
+                return row_buttons[0], True
+
+            for idx, button in enumerate(row_buttons):
+                rect = button.geometry()
+                if rect.left() <= position.x() <= rect.right():
+                    # Cursor is above an icon, ignore so that only the gaps react.
+                    return None
+                next_button = row_buttons[idx + 1] if idx + 1 < len(row_buttons) else None
+                if next_button:
+                    gap_start = rect.right()
+                    gap_end = next_button.geometry().left()
+                    if gap_end > gap_start and gap_start <= position.x() <= gap_end:
+                        return next_button, True
+
+            last_rect = row_buttons[-1].geometry()
+            if position.x() > last_rect.right():
+                return row_buttons[-1], False
+
+        return None
+
 
 
 class LaunchpadWindow(QWidget):
@@ -580,24 +674,16 @@ class LaunchpadWindow(QWidget):
             )
             page_layout.setSpacing(0)
 
-            grid_container = QWidget()
+            grid_container = ApplicationGridWidget()
             grid_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             grid_container.setFixedWidth(FULL_GRID_WIDTH)
-
-            grid = QGridLayout(grid_container)
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(GRID_HORIZONTAL_SPACING)
-            grid.setVerticalSpacing(GRID_VERTICAL_SPACING)
+            grid_container.reorder_requested.connect(self._on_reorder_requested)
 
             for position, app in enumerate(page_apps):
                 row = position // APP_COLUMNS
                 column = position % APP_COLUMNS
                 button = ApplicationButton(app)
-                button.reorder_requested.connect(self._on_reorder_requested)
-                grid.addWidget(button, row, column)
-
-            grid.setColumnStretch(APP_COLUMNS, 1)
-            grid.setRowStretch(APP_ROWS, 1)
+                grid_container.add_button(button, row, column)
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
             page_layout.addWidget(grid_container, alignment=Qt.AlignTop | Qt.AlignLeft)
             page_layout.addStretch(1)
