@@ -8,6 +8,9 @@ keyboard arrows, and close the launchpad when an application is launched.
 
 from __future__ import annotations
 
+import argparse
+import atexit
+
 import configparser
 import json
 import math
@@ -35,9 +38,11 @@ from PyQt5.QtCore import (
     QPropertyAnimation,
     QParallelAnimationGroup,
     QAbstractAnimation,
+    QObject,
     pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
+from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -95,6 +100,9 @@ _DEFAULT_ICON_SUBDIRS = (
     "places",
     "status",
 )
+
+
+DEFAULT_CONTROL_SOCKET = Path.home() / ".local/run/lpad-ui.sock"
 
 
 def _icon_search_roots() -> list[Path]:
@@ -1787,7 +1795,10 @@ class SlidingStackedWidget(QStackedWidget):
 class LaunchpadWindow(QWidget):
     """Main fullscreen window containing the paginated application grid."""
 
-    def __init__(self, apps: List[Application]) -> None:
+    shown = pyqtSignal()
+    hidden = pyqtSignal()
+
+    def __init__(self, apps: List[Application], *, resident: bool = False) -> None:
         super().__init__()
         self._all_apps = apps
         self._hidden_paths: set[str] = _load_hidden_paths()
@@ -1798,9 +1809,13 @@ class LaunchpadWindow(QWidget):
         self._folder_popup: FolderPopup | None = None
         self._grids: list[ApplicationGridWidget] = []
         self._labels_visible = _load_label_visibility()
+        self._resident = resident
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_DeleteOnClose)
+        if not self._resident:
+            self.setAttribute(Qt.WA_DeleteOnClose)
+        else:
+            self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
@@ -1875,11 +1890,47 @@ class LaunchpadWindow(QWidget):
         self._update_page_indicator()
         QTimer.singleShot(0, self._search_field.setFocus)
 
+    def show_launchpad(self) -> None:
+        """Present the launchpad window on screen."""
+
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self._search_field.setFocus)
+        self.shown.emit()
+
+    def hide_launchpad(self) -> None:
+        """Hide the launchpad window while keeping the process alive."""
+
+        if not self._resident:
+            self.close()
+            return
+        self._reset_after_hide()
+        self.hide()
+        self.hidden.emit()
+
+    def _reset_after_hide(self) -> None:
+        """Restore default layout state when the window is dismissed."""
+
+        self._close_folder_popup()
+        if self._search_field.text():
+            self._search_field.setText("")
+        else:
+            self._search_query = ""
+            self._filtered_items = list(self._layout_items)
+            self._rebuild_pages()
+        if self._stack.count():
+            self._stack.setCurrentIndex(0)
+        self._update_page_indicator()
+
     def eventFilter(self, obj, event):
         if obj is self._search_field and event.type() == QEvent.KeyPress:
             key = event.key()
             if key == Qt.Key_Escape:
-                self.close()
+                if self._resident:
+                    self.hide_launchpad()
+                else:
+                    self.close()
                 return True
             if event.modifiers() == Qt.NoModifier and key in (Qt.Key_Right, Qt.Key_Down):
                 self.next_page()
@@ -1888,6 +1939,14 @@ class LaunchpadWindow(QWidget):
                 self.previous_page()
                 return True
         return super().eventFilter(obj, event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._resident:
+            event.ignore()
+            self.hide_launchpad()
+            return
+        self.hidden.emit()
+        super().closeEvent(event)
 
     def _build_layout_items(self, apps: List[Application]) -> List[LayoutItem]:
         entries = _load_saved_layout_entries()
@@ -2356,14 +2415,136 @@ class LaunchpadWindow(QWidget):
         _save_layout(self._layout_items)
 
 
-def main() -> None:
+class LaunchpadController(QObject):
+    """Accept commands over a UNIX socket to control the window lifecycle."""
+
+    def __init__(self, window: LaunchpadWindow, socket_path: Path) -> None:
+        super().__init__(window)
+        self._window = window
+        self._socket_path = socket_path
+        self._server = QLocalServer(self)
+        self._connections: list[QLocalSocket] = []
+
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        QLocalServer.removeServer(str(socket_path))
+        try:
+            if socket_path.exists():
+                socket_path.unlink()
+        except OSError:
+            pass
+
+        if not self._server.listen(str(socket_path)):
+            raise RuntimeError(
+                f"Unable to bind launchpad control socket at {socket_path}: {self._server.errorString()}"
+            )
+
+        atexit.register(self._cleanup_socket)
+        self._server.newConnection.connect(self._on_new_connection)
+
+    def _cleanup_socket(self) -> None:
+        try:
+            if self._server.isListening():
+                self._server.close()
+        except RuntimeError:
+            pass
+        try:
+            if self._socket_path.exists():
+                self._socket_path.unlink()
+        except OSError:
+            pass
+
+    def _on_new_connection(self) -> None:
+        while self._server.hasPendingConnections():
+            socket = self._server.nextPendingConnection()
+            if socket is None:
+                continue
+            self._connections.append(socket)
+            socket.readyRead.connect(lambda s=socket: self._process_socket(s))
+            socket.disconnected.connect(lambda s=socket: self._remove_socket(s))
+
+    def _remove_socket(self, socket: QLocalSocket) -> None:
+        try:
+            socket.deleteLater()
+        except RuntimeError:
+            pass
+        if socket in self._connections:
+            self._connections.remove(socket)
+
+    def _process_socket(self, socket: QLocalSocket) -> None:
+        try:
+            data = bytes(socket.readAll())
+        except RuntimeError:
+            data = b""
+        if not data:
+            return
+        command = data.decode("utf-8", errors="ignore").strip()
+        response = self._handle_command(command)
+        try:
+            socket.write(response.encode("utf-8"))
+            socket.flush()
+        except RuntimeError:
+            pass
+        finally:
+            try:
+                socket.disconnectFromServer()
+            except RuntimeError:
+                pass
+
+    def _handle_command(self, command: str) -> str:
+        normalized = command.strip().lower()
+        if not normalized:
+            return "ERROR Empty command"
+        if normalized == "open":
+            self._window.show_launchpad()
+            return "OK Launchpad shown"
+        if normalized == "hide":
+            self._window.hide_launchpad()
+            return "OK Launchpad hidden"
+        if normalized == "ping":
+            return "OK Launchpad ready"
+        return f"ERROR Unknown command: {command}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="LPAD application grid")
+    parser.add_argument(
+        "--resident",
+        action="store_true",
+        help="Keep the launchpad process alive for fast activation",
+    )
+    parser.add_argument(
+        "--control-socket",
+        metavar="PATH",
+        default=str(DEFAULT_CONTROL_SOCKET),
+        help="Path to the UNIX socket used for resident mode commands",
+    )
+    args = parser.parse_args()
+
     apps = load_applications()
     app = QApplication(sys.argv)
-    window = LaunchpadWindow(apps)
-    window.showFullScreen()
-    sys.exit(app.exec_())
+    if args.resident:
+        app.setQuitOnLastWindowClosed(False)
+    window = LaunchpadWindow(apps, resident=args.resident)
+
+    controller: LaunchpadController | None = None
+    if args.resident:
+        socket_path = Path(args.control_socket)
+        try:
+            controller = LaunchpadController(window, socket_path)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    if not args.resident:
+        window.showFullScreen()
+
+    # Keep references alive for the lifetime of the application.
+    _ = controller
+
+    app.exec_()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 

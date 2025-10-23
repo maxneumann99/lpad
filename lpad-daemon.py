@@ -7,14 +7,26 @@ import atexit
 import os
 import signal
 import socket
-import subprocess
 import sys
+import subprocess
+import time
 from pathlib import Path
 
 INSTALL_ROOT = Path.home() / ".local/apps/lpad"
 LAUNCHPAD_SCRIPT = INSTALL_ROOT / "launchpad.py"
 SOCKET_PATH = Path.home() / ".local/run/lpad-daemon.sock"
+CONTROL_SOCKET_PATH = Path.home() / ".local/run/lpad-ui.sock"
 BUFFER_SIZE = 4096
+
+
+def _resolve_launchpad_script() -> Path | None:
+    """Return the best available path to launchpad.py."""
+
+    local = Path(__file__).resolve().parent / "launchpad.py"
+    for candidate in (LAUNCHPAD_SCRIPT, local):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class LpadDaemon:
@@ -22,6 +34,7 @@ class LpadDaemon:
 
     def __init__(self) -> None:
         self._running = True
+        self._launchpad_process: subprocess.Popen | None = None
 
     def _cleanup_socket(self) -> None:
         try:
@@ -33,19 +46,119 @@ class LpadDaemon:
     def _handle_signal(self, _signum, _frame) -> None:
         self._running = False
 
-    def _handle_open(self) -> tuple[bool, str]:
-        if not LAUNCHPAD_SCRIPT.exists():
-            return False, f"Launchpad script missing: {LAUNCHPAD_SCRIPT}"
+    def _launchpad_running(self) -> bool:
+        return self._launchpad_process is not None and self._launchpad_process.poll() is None
+
+    def _terminate_launchpad(self) -> None:
+        process = self._launchpad_process
+        if not process:
+            return
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            except OSError:
+                pass
+        self._launchpad_process = None
+
+    def _send_launchpad_command(
+        self, command: str, retries: int = 0, delay: float = 0.2
+    ) -> tuple[bool, str]:
+        for attempt in range(retries + 1):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1.0)
+                    sock.connect(str(CONTROL_SOCKET_PATH))
+                    sock.sendall(command.encode("utf-8"))
+                    sock.shutdown(socket.SHUT_WR)
+                    chunks: list[bytes] = []
+                    while True:
+                        data = sock.recv(BUFFER_SIZE)
+                        if not data:
+                            break
+                        chunks.append(data)
+                    response = b"".join(chunks).decode("utf-8", errors="ignore").strip()
+                    if not response:
+                        return False, "Empty response from launchpad"
+                    if response.upper().startswith("OK"):
+                        return True, response
+                    return False, response
+            except (FileNotFoundError, ConnectionRefusedError, socket.error, OSError):
+                if attempt >= retries:
+                    return False, "Launchpad unreachable"
+                time.sleep(delay)
+        return False, "Launchpad unreachable"
+
+    def _wait_for_launchpad_ready(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._launchpad_process and self._launchpad_process.poll() is not None:
+                self._launchpad_process = None
+                return False
+            ok, _ = self._send_launchpad_command("ping", retries=0)
+            if ok:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _start_launchpad(self) -> tuple[bool, str]:
+        launchpad_script = _resolve_launchpad_script()
+        if launchpad_script is None:
+            return False, "Launchpad script not found"
+
         try:
-            subprocess.Popen(
-                [sys.executable, str(LAUNCHPAD_SCRIPT)],
+            if CONTROL_SOCKET_PATH.exists():
+                CONTROL_SOCKET_PATH.unlink()
+        except OSError:
+            pass
+
+        try:
+            self._launchpad_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(launchpad_script),
+                    "--resident",
+                    "--control-socket",
+                    str(CONTROL_SOCKET_PATH),
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
         except OSError as exc:
+            self._launchpad_process = None
             return False, f"Failed to start launchpad: {exc}"
-        return True, "Launchpad started"
+
+        if not self._wait_for_launchpad_ready():
+            self._terminate_launchpad()
+            return False, "Launchpad did not become ready"
+        return True, "Launchpad ready"
+
+    def _ensure_launchpad(self) -> tuple[bool, str]:
+        if self._launchpad_running():
+            return True, "Launchpad already running"
+        return self._start_launchpad()
+
+    def _handle_open(self) -> tuple[bool, str]:
+        ok, message = self._ensure_launchpad()
+        if not ok:
+            return False, message
+
+        ok, response = self._send_launchpad_command("open", retries=2)
+        if ok:
+            return True, "Launchpad shown"
+
+        # Retry once by restarting the launchpad process.
+        self._terminate_launchpad()
+        ok, message = self._start_launchpad()
+        if not ok:
+            return False, message
+        ok, response = self._send_launchpad_command("open", retries=2)
+        if ok:
+            return True, "Launchpad shown"
+        return False, response
 
     def _handle_ping(self) -> tuple[bool, str]:
         return True, "pong"
@@ -90,11 +203,19 @@ class LpadDaemon:
             return 1
 
         atexit.register(self._cleanup_socket)
+        atexit.register(self._terminate_launchpad)
+
+        # Start the launchpad process immediately so the UI is ready to show on demand.
+        ready, message = self._ensure_launchpad()
+        if not ready:
+            print(f"lpad-daemon: {message}", file=sys.stderr)
 
         while self._running:
             try:
                 client, _ = server.accept()
             except socket.timeout:
+                if self._launchpad_process and self._launchpad_process.poll() is not None:
+                    self._launchpad_process = None
                 continue
             except OSError:
                 break
@@ -122,6 +243,7 @@ class LpadDaemon:
         except OSError:
             pass
         self._cleanup_socket()
+        self._terminate_launchpad()
         return 0
 
 
