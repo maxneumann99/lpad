@@ -779,12 +779,6 @@ class ApplicationGridWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._grid = QGridLayout(self)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(GRID_HORIZONTAL_SPACING)
-        self._grid.setVerticalSpacing(GRID_VERTICAL_SPACING)
-        self._grid.setColumnStretch(APP_COLUMNS, 1)
-        self._grid.setRowStretch(APP_ROWS, 1)
         self._tiles: list[LaunchpadTileButton] = []
         self._placeholder_index: int | None = None
         self._placeholder = QWidget(self)
@@ -801,9 +795,25 @@ class ApplicationGridWidget(QWidget):
     def add_button(self, button: LaunchpadTileButton, row: int, column: int) -> None:
         """Add a tile button to the grid at the specified position."""
 
-        self._grid.addWidget(button, row, column)
+        button.setParent(self)
+        button.resize(button.sizeHint())
+        button.show()
+        button.installEventFilter(self)
         self._tiles.append(button)
         self._update_placeholder_size(button)
+        self._reflow_tiles()
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(FULL_GRID_WIDTH, self._calculated_height())
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return self.sizeHint()
+
+    def eventFilter(self, obj, event):
+        if isinstance(obj, LaunchpadTileButton) and event is not None:
+            if event.type() in (QEvent.Hide, QEvent.Show, QEvent.HideToParent, QEvent.ShowToParent):
+                QTimer.singleShot(0, self._reflow_tiles)
+        return super().eventFilter(obj, event)
 
     def dragEnterEvent(self, event):  # type: ignore[override]
         if event.mimeData().hasFormat(LaunchpadTileButton.MIME_TYPE):
@@ -969,16 +979,6 @@ class ApplicationGridWidget(QWidget):
         self._stop_animations()
         self.setUpdatesEnabled(False)
         try:
-            old_positions: dict[QWidget, QRect] = {}
-            for tile in self._tiles:
-                if tile.isVisible():
-                    old_positions[tile] = tile.geometry()
-            if self._placeholder.isVisible():
-                old_positions[self._placeholder] = self._placeholder.geometry()
-
-            while self._grid.count():
-                self._grid.takeAt(0)
-
             visible = self._visible_tiles()
             if self._placeholder_index is None:
                 self._placeholder.hide()
@@ -987,36 +987,84 @@ class ApplicationGridWidget(QWidget):
                 index = max(0, min(self._placeholder_index, len(visible)))
                 widgets = visible[:index] + [self._placeholder] + visible[index:]
                 self._placeholder.show()
+            row_height = self._row_height()
+            total_widgets = len(widgets)
+            self._update_container_height(total_widgets, row_height)
 
             for position, widget in enumerate(widgets):
-                row = position // APP_COLUMNS
-                column = position % APP_COLUMNS
-                self._grid.addWidget(widget, row, column)
-
-            self._grid.activate()
-
-            for widget in widgets:
+                target_rect = self._target_rect(position, row_height, widget)
                 if widget is self._placeholder:
+                    widget.setGeometry(target_rect)
+                    widget.raise_()
                     continue
-                old_rect = old_positions.get(widget)
-                new_rect = widget.geometry()
-                if old_rect is None or old_rect == new_rect:
+
+                current_rect = widget.geometry()
+                if not current_rect.isValid() or current_rect.size().isEmpty():
+                    widget.setGeometry(target_rect)
                     continue
-                widget.setGeometry(old_rect)
+                if current_rect == target_rect:
+                    continue
                 animation = QPropertyAnimation(widget, b"geometry", self)
-                animation.setDuration(180)
+                animation.setDuration(220)
                 animation.setEasingCurve(QEasingCurve.OutCubic)
-                animation.setStartValue(old_rect)
-                animation.setEndValue(new_rect)
+                animation.setStartValue(current_rect)
+                animation.setEndValue(target_rect)
                 animation.finished.connect(lambda w=animation: self._on_animation_finished(w))
                 animation.start()
                 self._active_animations.append(animation)
-
-            if self._placeholder_index is None:
-                self._grid.removeWidget(self._placeholder)
         finally:
             self.setUpdatesEnabled(True)
             self.update()
+
+    def _calculated_height(self) -> int:
+        visible_count = len(self._visible_tiles())
+        if self._placeholder_index is not None:
+            visible_count += 1
+        if visible_count == 0:
+            return 0
+        row_height = self._row_height()
+        rows = math.ceil(visible_count / APP_COLUMNS)
+        return rows * row_height + max(0, rows - 1) * GRID_VERTICAL_SPACING
+
+    def _row_height(self) -> int:
+        heights: list[int] = []
+        for tile in self._tiles:
+            if not tile.isVisible():
+                continue
+            hint = tile.sizeHint()
+            height = hint.height() if hint.isValid() else tile.height()
+            if height <= 0:
+                height = tile.geometry().height()
+            if height <= 0:
+                height = 120
+            heights.append(height)
+        if self._placeholder.isVisible():
+            heights.append(self._placeholder.height())
+        if not heights:
+            return 140
+        return max(heights)
+
+    def _target_rect(self, position: int, row_height: int, widget: QWidget) -> QRect:
+        column = position % APP_COLUMNS
+        row = position // APP_COLUMNS
+        x = column * (APP_TILE_WIDTH + GRID_HORIZONTAL_SPACING)
+        y = row * (row_height + GRID_VERTICAL_SPACING)
+        if widget is self._placeholder:
+            width = self._placeholder.width()
+            if width <= 0:
+                width = APP_TILE_WIDTH
+        else:
+            width = widget.width() or APP_TILE_WIDTH
+        return QRect(x, y, width, row_height)
+
+    def _update_container_height(self, item_count: int, row_height: int) -> None:
+        if item_count <= 0:
+            self.setFixedHeight(0)
+        else:
+            rows = math.ceil(item_count / APP_COLUMNS)
+            height = rows * row_height + max(0, rows - 1) * GRID_VERTICAL_SPACING
+            self.setFixedHeight(height)
+        self.updateGeometry()
 
     def _stop_animations(self) -> None:
         while self._active_animations:
