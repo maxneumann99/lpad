@@ -18,7 +18,7 @@ import subprocess
 import sys
 import uuid
 
-import sip
+import PyQt5.sip as sip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -450,10 +450,11 @@ class LaunchpadTileButton(QToolButton):
         drag.setHotSpot(event.pos())
 
         self.hide()
+        result = Qt.IgnoreAction
         try:
-            drag.exec_(Qt.MoveAction)
+            result = drag.exec_(Qt.MoveAction)
         finally:
-            if not sip.isdeleted(self):
+            if not sip.isdeleted(self) and result != Qt.MoveAction:
                 self.show()
         self._suppress_click = True
         self._drag_start_pos = None
