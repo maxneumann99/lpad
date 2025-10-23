@@ -64,12 +64,16 @@ class LpadDaemon:
         self._launchpad_process = None
 
     def _send_launchpad_command(
-        self, command: str, retries: int = 0, delay: float = 0.2
+        self,
+        command: str,
+        retries: int = 0,
+        delay: float = 0.2,
+        timeout: float = 0.25,
     ) -> tuple[bool, str]:
         for attempt in range(retries + 1):
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1.0)
+                    sock.settimeout(timeout)
                     sock.connect(str(CONTROL_SOCKET_PATH))
                     sock.sendall(command.encode("utf-8"))
                     sock.shutdown(socket.SHUT_WR)
@@ -97,7 +101,7 @@ class LpadDaemon:
             if self._launchpad_process and self._launchpad_process.poll() is not None:
                 self._launchpad_process = None
                 return False
-            ok, _ = self._send_launchpad_command("ping", retries=0)
+            ok, _ = self._send_launchpad_command("ping", retries=0, timeout=0.25)
             if ok:
                 return True
             time.sleep(0.2)
@@ -134,6 +138,8 @@ class LpadDaemon:
         if not self._wait_for_launchpad_ready():
             self._terminate_launchpad()
             return False, "Launchpad did not become ready"
+        # Ask the UI to prewarm so the first show happens instantly.
+        self._send_launchpad_command("warmup", retries=1, delay=0.1, timeout=0.25)
         return True, "Launchpad ready"
 
     def _ensure_launchpad(self) -> tuple[bool, str]:

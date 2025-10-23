@@ -1810,6 +1810,8 @@ class LaunchpadWindow(QWidget):
         self._grids: list[ApplicationGridWidget] = []
         self._labels_visible = _load_label_visibility()
         self._resident = resident
+        self._prewarmed = False
+        self._suspend_auto_close = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         if not self._resident:
@@ -1893,6 +1895,8 @@ class LaunchpadWindow(QWidget):
     def show_launchpad(self) -> None:
         """Present the launchpad window on screen."""
 
+        if self._resident and not self._prewarmed:
+            self.prewarm_for_resident()
         self.showFullScreen()
         self.raise_()
         self.activateWindow()
@@ -1942,6 +1946,9 @@ class LaunchpadWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._resident:
+            if self._suspend_auto_close:
+                event.ignore()
+                return
             event.ignore()
             self.hide_launchpad()
             return
@@ -2128,6 +2135,8 @@ class LaunchpadWindow(QWidget):
 
     def changeEvent(self, event) -> None:  # type: ignore[override]
         super().changeEvent(event)
+        if self._suspend_auto_close:
+            return
         if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
             self.close()
 
@@ -2170,6 +2179,31 @@ class LaunchpadWindow(QWidget):
             return True
 
         return False
+
+    def prewarm_for_resident(self) -> None:
+        """Create the backing window off-screen so the first show is instant."""
+
+        if not self._resident or self._prewarmed:
+            return
+
+        original_attr = self.testAttribute(Qt.WA_DontShowOnScreen)
+        if not original_attr:
+            self.setAttribute(Qt.WA_DontShowOnScreen, True)
+
+        self._suspend_auto_close = True
+        try:
+            # Trigger native window creation and layout polish without surfacing
+            self.showFullScreen()
+            QApplication.processEvents()
+            QApplication.processEvents()
+            self.hide()
+            QApplication.processEvents()
+        finally:
+            self._suspend_auto_close = False
+            if not original_attr:
+                self.setAttribute(Qt.WA_DontShowOnScreen, False)
+
+        self._prewarmed = True
 
     def _on_search_text_changed(self, text: str) -> None:
         self._search_query = text.strip().lower()
@@ -2500,6 +2534,9 @@ class LaunchpadController(QObject):
         if normalized == "hide":
             self._window.hide_launchpad()
             return "OK Launchpad hidden"
+        if normalized == "warmup":
+            self._window.prewarm_for_resident()
+            return "OK Launchpad warmed"
         if normalized == "ping":
             return "OK Launchpad ready"
         return f"ERROR Unknown command: {command}"
@@ -2534,6 +2571,7 @@ def main() -> int:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+        window.prewarm_for_resident()
 
     if not args.resident:
         window.showFullScreen()
