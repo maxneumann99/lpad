@@ -790,7 +790,18 @@ class ApplicationGridWidget(QWidget):
         )
         self._placeholder.hide()
         self._active_animations: list[QPropertyAnimation] = []
+        self._max_content_height: int | None = None
         self.setAcceptDrops(True)
+
+    def set_max_content_height(self, height: int) -> None:
+        """Limit how tall the grid can grow before rows start to shrink."""
+
+        raw_limit = int(height)
+        limit = None if raw_limit < 0 else max(0, raw_limit)
+        if limit == self._max_content_height:
+            return
+        self._max_content_height = limit
+        self._reflow_tiles()
 
     def add_button(self, button: LaunchpadTileButton, row: int, column: int) -> None:
         """Add a tile button to the grid at the specified position."""
@@ -988,6 +999,16 @@ class ApplicationGridWidget(QWidget):
                 widgets = visible[:index] + [self._placeholder] + visible[index:]
                 self._placeholder.show()
             row_height = self._row_height()
+            rows = math.ceil(total_widgets / APP_COLUMNS) if total_widgets else 0
+            spacing_total = max(0, rows - 1) * GRID_VERTICAL_SPACING
+            if (
+                rows > 0
+                and self._max_content_height is not None
+                and row_height * rows + spacing_total > self._max_content_height
+            ):
+                available = max(1, self._max_content_height - spacing_total)
+                row_height = max(1, min(row_height, available // rows))
+            self._placeholder.setFixedHeight(row_height)
             total_widgets = len(widgets)
             self._update_container_height(total_widgets, row_height)
 
@@ -1024,7 +1045,10 @@ class ApplicationGridWidget(QWidget):
             return 0
         row_height = self._row_height()
         rows = math.ceil(visible_count / APP_COLUMNS)
-        return rows * row_height + max(0, rows - 1) * GRID_VERTICAL_SPACING
+        height = rows * row_height + max(0, rows - 1) * GRID_VERTICAL_SPACING
+        if self._max_content_height is not None:
+            return min(height, self._max_content_height)
+        return height
 
     def _row_height(self) -> int:
         heights: list[int] = []
@@ -1059,11 +1083,13 @@ class ApplicationGridWidget(QWidget):
 
     def _update_container_height(self, item_count: int, row_height: int) -> None:
         if item_count <= 0:
-            self.setFixedHeight(0)
+            height = 0
         else:
             rows = math.ceil(item_count / APP_COLUMNS)
             height = rows * row_height + max(0, rows - 1) * GRID_VERTICAL_SPACING
-            self.setFixedHeight(height)
+            if self._max_content_height is not None:
+                height = min(height, self._max_content_height)
+        self.setFixedHeight(height)
         self.updateGeometry()
 
     def _stop_animations(self) -> None:
@@ -1092,6 +1118,7 @@ class LaunchpadWindow(QWidget):
         self._search_query = ""
         self._folder_buttons: dict[str, FolderButton] = {}
         self._folder_popup: FolderPopup | None = None
+        self._grids: list[ApplicationGridWidget] = []
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
@@ -1222,6 +1249,7 @@ class LaunchpadWindow(QWidget):
     def _clear_pages(self) -> None:
         self._close_folder_popup()
         self._folder_buttons.clear()
+        self._grids.clear()
         while self._stack.count():
             widget = self._stack.widget(0)
             self._stack.removeWidget(widget)
@@ -1268,6 +1296,8 @@ class LaunchpadWindow(QWidget):
                 else:
                     button = ApplicationButton(item)
                 grid_container.add_button(button, row, column)
+            self._grids.append(grid_container)
+            grid_container.set_max_content_height(self._grid_height_budget())
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
             page_layout.addWidget(grid_container, alignment=Qt.AlignTop | Qt.AlignLeft)
             page_layout.addStretch(1)
@@ -1330,6 +1360,12 @@ class LaunchpadWindow(QWidget):
         if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
             self.close()
 
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        budget = self._grid_height_budget()
+        for grid in self._grids:
+            grid.set_max_content_height(budget)
+
     def _handle_search_key(self, event) -> bool:
         modifiers = event.modifiers()
         if modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
@@ -1389,6 +1425,24 @@ class LaunchpadWindow(QWidget):
         self._layout_items.insert(target_index, item)
         _save_layout(self._layout_items)
         self._update_filtered_items()
+
+    def _grid_height_budget(self) -> int:
+        layout = self.layout()
+        if layout is None:
+            return 0
+        margins = layout.contentsMargins()
+        available = self.height() - margins.top() - margins.bottom()
+        if available <= 0:
+            return 0
+        spacing = max(0, layout.spacing())
+        search_height = self._search_field.height() or self._search_field.sizeHint().height()
+        indicator_height = self._page_indicator.sizeHint().height()
+        available -= search_height
+        available -= indicator_height
+        available -= 10
+        available -= spacing * 4
+        available -= 2 * PAGE_CONTAINER_MARGIN
+        return max(0, available)
 
     @staticmethod
     def _item_key(item: LayoutItem) -> str:
