@@ -240,7 +240,6 @@ class ApplicationButton(QToolButton):
         super().__init__(parent)
         self._app = app
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        self.setText(app.name)
         self.setIcon(self._create_icon(app.icon_name))
         self.setIconSize(QSize(64, 64))
         self.setAutoRaise(False)
@@ -252,6 +251,7 @@ class ApplicationButton(QToolButton):
             "QToolButton { padding: 10px; text-align: center; }\n"
             "QToolButton::menu-indicator { image: none; }"
         )
+        self.setText(self._format_label(app.name))
         self.clicked.connect(self._on_clicked)
 
     @staticmethod
@@ -269,6 +269,51 @@ class ApplicationButton(QToolButton):
         window = self.window()
         if window:
             window.close()
+
+    def _format_label(self, text: str) -> str:
+        """Return the button label wrapped to fit within the tile width."""
+
+        metrics = self.fontMetrics()
+        max_width = max(20, APP_TILE_WIDTH - 20)  # account for padding
+        max_lines = 2
+        lines: list[str] = []
+        index = 0
+        length = len(text)
+
+        while index < length and len(lines) < max_lines:
+            remaining_lines = max_lines - len(lines)
+            if remaining_lines == 1:
+                remaining_text = text[index:].lstrip()
+                elided = metrics.elidedText(remaining_text, Qt.ElideRight, max_width)
+                lines.append(elided.rstrip())
+                break
+
+            current = ""
+            while index < length:
+                char = text[index]
+                tentative = current + char
+                if metrics.horizontalAdvance(tentative) <= max_width or not current:
+                    current = tentative
+                    index += 1
+                else:
+                    break
+
+            if not current:
+                current = text[index]
+                index += 1
+
+            current = current.rstrip()
+            if not current:
+                continue
+
+            lines.append(current)
+            while index < length and text[index] == " ":
+                index += 1
+
+        if not lines:
+            lines.append("")
+
+        return "\n".join(lines)
 
 
 class LaunchpadWindow(QWidget):
