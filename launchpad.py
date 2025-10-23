@@ -33,6 +33,8 @@ from PyQt5.QtCore import (
     QMimeData,
     QEasingCurve,
     QPropertyAnimation,
+    QParallelAnimationGroup,
+    QAbstractAnimation,
     pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
@@ -42,9 +44,11 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
+    QStackedLayout,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -68,6 +72,9 @@ FULL_PAGE_WIDTH = FULL_GRID_WIDTH + PAGE_CONTAINER_MARGIN * 2
 CONFIG_PATH = Path.home() / ".config/lpad/lpad.conf"
 CONFIG_SECTION = "apps"
 CONFIG_KEY = "order"
+CONFIG_HIDDEN_KEY = "hidden"
+CONFIG_UI_SECTION = "ui"
+CONFIG_SHOW_LABELS_KEY = "show_labels"
 DEFAULT_FOLDER_NAME = "Папка"
 
 
@@ -240,6 +247,71 @@ def _load_saved_order_paths() -> List[str]:
     return paths
 
 
+def _load_hidden_paths() -> set[str]:
+    """Return the set of desktop file paths that should stay hidden."""
+
+    if not CONFIG_PATH.exists():
+        return set()
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        return set()
+
+    if not config.has_option(CONFIG_SECTION, CONFIG_HIDDEN_KEY):
+        return set()
+
+    raw_value = config.get(CONFIG_SECTION, CONFIG_HIDDEN_KEY, fallback="").strip()
+    if not raw_value:
+        return set()
+
+    paths: set[str] = set()
+    try:
+        data = json.loads(raw_value)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, str) and entry:
+                paths.add(entry)
+    else:
+        for line in raw_value.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                paths.add(cleaned)
+
+    return paths
+
+
+def _save_hidden_paths(paths: set[str]) -> None:
+    """Persist the provided hidden desktop paths to the config file."""
+
+    config = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except OSError:
+            config = configparser.ConfigParser()
+
+    if CONFIG_SECTION not in config:
+        config[CONFIG_SECTION] = {}
+
+    serialized = json.dumps(sorted(paths), ensure_ascii=False, indent=2) if paths else ""
+    if serialized:
+        config[CONFIG_SECTION][CONFIG_HIDDEN_KEY] = serialized
+    elif CONFIG_HIDDEN_KEY in config[CONFIG_SECTION]:
+        del config[CONFIG_SECTION][CONFIG_HIDDEN_KEY]
+
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            config.write(fh)
+    except OSError:
+        pass
+
+
 def _serialize_layout(items: Sequence[LayoutItem]) -> str:
     """Return a JSON string representing the provided layout items."""
 
@@ -280,6 +352,48 @@ def _save_layout(items: Sequence[LayoutItem]) -> None:
             config.write(fh)
     except OSError:
         # Failing to persist the order is non-critical; ignore errors silently.
+        pass
+
+
+def _load_label_visibility(default: bool = True) -> bool:
+    """Return whether application tile captions should be shown."""
+
+    if not CONFIG_PATH.exists():
+        return default
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        return default
+
+    if not config.has_option(CONFIG_UI_SECTION, CONFIG_SHOW_LABELS_KEY):
+        return default
+
+    value = config.get(CONFIG_UI_SECTION, CONFIG_SHOW_LABELS_KEY, fallback="true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _save_label_visibility(visible: bool) -> None:
+    """Persist the preference controlling tile caption visibility."""
+
+    config = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except OSError:
+            config = configparser.ConfigParser()
+
+    if CONFIG_UI_SECTION not in config:
+        config[CONFIG_UI_SECTION] = {}
+
+    config[CONFIG_UI_SECTION][CONFIG_SHOW_LABELS_KEY] = "1" if visible else "0"
+
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            config.write(fh)
+    except OSError:
         pass
 
 
@@ -408,6 +522,8 @@ class LaunchpadTileButton(QToolButton):
         self._drag_start_pos: QPoint | None = None
         self._suppress_click = False
         self._drag_enabled = True
+        self._label_visible = True
+        self._raw_label_text = ""
         self.setAcceptDrops(False)
 
     def set_drag_enabled(self, enabled: bool) -> None:
@@ -518,9 +634,45 @@ class LaunchpadTileButton(QToolButton):
 
         return "\n".join(lines)
 
+    def set_raw_label_text(self, text: str) -> None:
+        """Store the base label text and refresh the caption."""
+
+        self._raw_label_text = text
+        self._refresh_label_text()
+
+    def raw_label_text(self) -> str:
+        return self._raw_label_text
+
+    def set_label_visible(self, visible: bool) -> None:
+        """Toggle whether the button caption is visible."""
+
+        visible = bool(visible)
+        if self._label_visible == visible:
+            return
+        self._label_visible = visible
+        self._refresh_label_text()
+
+    def label_visible(self) -> bool:
+        return self._label_visible
+
+    def _refresh_label_text(self) -> None:
+        if self._label_visible:
+            self._update_tool_button_style()
+            self.setText(self._format_label(self._raw_label_text))
+        else:
+            self._update_tool_button_style()
+            self.setText("")
+
+    def _update_tool_button_style(self) -> None:
+        desired = Qt.ToolButtonTextUnderIcon if self._label_visible else Qt.ToolButtonIconOnly
+        if self.toolButtonStyle() != desired:
+            self.setToolButtonStyle(desired)
+
 
 class ApplicationButton(LaunchpadTileButton):
     """Button representing a single application entry."""
+
+    hide_requested = pyqtSignal(str)
 
     def __init__(self, app: Application, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -537,7 +689,7 @@ class ApplicationButton(LaunchpadTileButton):
             "QToolButton { padding: 10px; text-align: center; }\n"
             "QToolButton::menu-indicator { image: none; }"
         )
-        self.setText(self._format_label(app.name))
+        self.set_raw_label_text(app.name)
         self.clicked.connect(self._on_clicked)
 
     @staticmethod
@@ -573,6 +725,13 @@ class ApplicationButton(LaunchpadTileButton):
             "path": self.desktop_path,
         }
 
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        hide_action = menu.addAction("Скрыть ярлык")
+        chosen = menu.exec_(event.globalPos())
+        if chosen is hide_action:
+            self.hide_requested.emit(self.desktop_path)
+
 
 class FolderButton(LaunchpadTileButton):
     """Button representing a folder containing multiple applications."""
@@ -594,7 +753,7 @@ class FolderButton(LaunchpadTileButton):
             "QToolButton { padding: 10px; text-align: center; }\n"
             "QToolButton::menu-indicator { image: none; }"
         )
-        self.setText(self._format_label(folder.name))
+        self.set_raw_label_text(folder.name)
         self.clicked.connect(self._on_clicked)
 
     def _update_icon(self) -> None:
@@ -643,7 +802,7 @@ class FolderButton(LaunchpadTileButton):
 
     def set_folder_name(self, name: str) -> None:
         self._folder.name = name
-        self.setText(self._format_label(name))
+        self.set_raw_label_text(name)
 
     def set_folder_apps(self, apps: List[Application]) -> None:
         self._folder.apps = apps
@@ -685,10 +844,19 @@ class FolderPopup(QWidget):
 
     rename_requested = pyqtSignal(str)
     closed = pyqtSignal()
+    app_hide_requested = pyqtSignal(str)
 
-    def __init__(self, folder: FolderItem, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        folder: FolderItem,
+        parent: QWidget | None = None,
+        *,
+        labels_visible: bool = True,
+    ) -> None:
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self._folder = folder
+        self._labels_visible = labels_visible
+        self._app_buttons: list[ApplicationButton] = []
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setStyleSheet(
             "background-color: rgba(255, 255, 255, 235);"
@@ -751,6 +919,7 @@ class FolderPopup(QWidget):
         self.rename_requested.emit(new_name)
 
     def _populate_apps(self) -> None:
+        self._app_buttons = []
         while self._grid.count():
             item = self._grid.takeAt(0)
             widget = item.widget()
@@ -763,12 +932,25 @@ class FolderPopup(QWidget):
             row = index // FOLDER_COLUMNS
             column = index % FOLDER_COLUMNS
             self._grid.addWidget(button, row, column)
+            button.set_label_visible(self._labels_visible)
+            button.hide_requested.connect(self.app_hide_requested.emit)
+            self._app_buttons.append(button)
         self._update_size()
 
     def _update_size(self) -> None:
         columns = min(FOLDER_COLUMNS, max(1, len(self._folder.apps)))
         width = columns * APP_TILE_WIDTH + max(0, columns - 1) * 20 + 48
         self.setFixedWidth(width)
+
+    def set_labels_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._labels_visible == visible:
+            return
+        self._labels_visible = visible
+        for button in list(self._app_buttons):
+            if sip.isdeleted(button):
+                continue
+            button.set_label_visible(visible)
 
 
 class ApplicationGridWidget(QWidget):
@@ -813,6 +995,18 @@ class ApplicationGridWidget(QWidget):
         self._tiles.append(button)
         self._update_placeholder_size(button)
         self._reflow_tiles()
+
+    def set_labels_visible(self, visible: bool) -> None:
+        """Show or hide captions for all tiles inside the grid."""
+
+        changed = False
+        for tile in self._tiles:
+            previous = tile.label_visible()
+            tile.set_label_visible(visible)
+            changed = changed or (previous != visible)
+        if changed:
+            self._update_placeholder_size()
+            self._reflow_tiles()
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
         return QSize(FULL_GRID_WIDTH, self._calculated_height())
@@ -1144,6 +1338,149 @@ class ApplicationGridWidget(QWidget):
         animation.deleteLater()
 
 
+class SlidingStackedWidget(QStackedWidget):
+    """A ``QStackedWidget`` variant that slides pages horizontally when switching."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        if hasattr(QStackedWidget, "setStackingMode"):
+            QStackedWidget.setStackingMode(self, QStackedLayout.StackAll)
+        else:
+            layout = self.layout()
+            if isinstance(layout, QStackedLayout):
+                layout.setStackingMode(QStackedLayout.StackAll)
+        self._animation: QParallelAnimationGroup | None = None
+        self._pending_index: int | None = None
+        self._animation_duration = 280
+        self.currentChanged.connect(self._ensure_single_visible)
+
+    @property
+    def is_animating(self) -> bool:
+        return bool(
+            self._animation
+            and self._animation.state() == QAbstractAnimation.Running
+        )
+
+    def stop_animations(self) -> None:
+        if not self._animation:
+            return
+        try:
+            self._animation.finished.disconnect(self._on_animation_finished)
+        except TypeError:
+            pass
+        self._animation.stop()
+        self._animation.deleteLater()
+        self._animation = None
+        self._pending_index = None
+        self._reset_widget_positions()
+
+    def slide_to_index(self, index: int, direction: int) -> None:
+        count = self.count()
+        if index < 0 or index >= count:
+            return
+        if index == self.currentIndex():
+            return
+        if self.is_animating:
+            return
+
+        current_widget = self.currentWidget()
+        next_widget = self.widget(index)
+        if current_widget is None or next_widget is None:
+            QStackedWidget.setCurrentIndex(self, index)
+            return
+
+        frame = self.frameRect()
+        start_point = frame.topLeft()
+        width = frame.width()
+        if width <= 0:
+            width = max(self.width(), next_widget.width(), current_widget.width())
+        if width <= 0:
+            QStackedWidget.setCurrentIndex(self, index)
+            return
+
+        offset = QPoint(width, 0)
+        direction = 1 if direction >= 0 else -1
+        if direction > 0:
+            current_end = start_point - offset
+            next_start = start_point + offset
+        else:
+            current_end = start_point + offset
+            next_start = start_point - offset
+
+        next_widget.setVisible(True)
+        next_widget.raise_()
+        next_widget.move(next_start)
+
+        current_anim = QPropertyAnimation(current_widget, b"pos", self)
+        current_anim.setDuration(self._animation_duration)
+        current_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        current_anim.setStartValue(start_point)
+        current_anim.setEndValue(current_end)
+
+        next_anim = QPropertyAnimation(next_widget, b"pos", self)
+        next_anim.setDuration(self._animation_duration)
+        next_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        next_anim.setStartValue(next_start)
+        next_anim.setEndValue(start_point)
+
+        animation_group = QParallelAnimationGroup(self)
+        animation_group.addAnimation(current_anim)
+        animation_group.addAnimation(next_anim)
+        animation_group.finished.connect(self._on_animation_finished)
+
+        self._animation = animation_group
+        self._pending_index = index
+        animation_group.start()
+
+    def addWidget(self, widget: QWidget) -> int:  # type: ignore[override]
+        index = QStackedWidget.addWidget(self, widget)
+        widget.move(self.frameRect().topLeft())
+        widget.setVisible(index == self.currentIndex())
+        return index
+
+    def insertWidget(self, index: int, widget: QWidget) -> int:  # type: ignore[override]
+        index = QStackedWidget.insertWidget(self, index, widget)
+        widget.move(self.frameRect().topLeft())
+        widget.setVisible(index == self.currentIndex())
+        return index
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._reset_widget_positions()
+
+    def _reset_widget_positions(self) -> None:
+        origin = self.frameRect().topLeft()
+        for idx in range(self.count()):
+            widget = self.widget(idx)
+            if widget is None:
+                continue
+            widget.move(origin)
+            widget.setVisible(idx == self.currentIndex())
+
+    def _ensure_single_visible(self, index: int) -> None:
+        if self.is_animating:
+            return
+        self._reset_widget_positions()
+
+    def _on_animation_finished(self) -> None:
+        if not self._animation:
+            return
+        try:
+            self._animation.finished.disconnect(self._on_animation_finished)
+        except TypeError:
+            pass
+        self._animation.deleteLater()
+        self._animation = None
+
+        target_index = self._pending_index
+        self._pending_index = None
+        if target_index is None:
+            self._reset_widget_positions()
+            return
+
+        QStackedWidget.setCurrentIndex(self, target_index)
+        self._reset_widget_positions()
+
 
 class LaunchpadWindow(QWidget):
     """Main fullscreen window containing the paginated application grid."""
@@ -1151,21 +1488,24 @@ class LaunchpadWindow(QWidget):
     def __init__(self, apps: List[Application]) -> None:
         super().__init__()
         self._all_apps = apps
+        self._hidden_paths: set[str] = _load_hidden_paths()
         self._layout_items: List[LayoutItem] = self._build_layout_items(apps)
         self._background = _read_kde_wallpaper()
         self._search_query = ""
         self._folder_buttons: dict[str, FolderButton] = {}
         self._folder_popup: FolderPopup | None = None
         self._grids: list[ApplicationGridWidget] = []
+        self._labels_visible = _load_label_visibility()
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
-        self._stack = QStackedWidget()
+        self._stack = SlidingStackedWidget()
         self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self._stack.setFixedWidth(FULL_PAGE_WIDTH)
+        self._stack.currentChanged.connect(self._update_page_indicator)
 
         self._search_field = QLineEdit()
         self._search_field.setPlaceholderText("Поиск приложений")
@@ -1246,6 +1586,8 @@ class LaunchpadWindow(QWidget):
         used: set[str] = set()
         layout: List[LayoutItem] = []
 
+        hidden = self._hidden_paths
+
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1253,7 +1595,12 @@ class LaunchpadWindow(QWidget):
             if entry_type == "folder":
                 paths: list[str] = []
                 for path in entry.get("apps", []) or []:
-                    if isinstance(path, str) and path in app_lookup and path not in used:
+                    if (
+                        isinstance(path, str)
+                        and path in app_lookup
+                        and path not in used
+                        and path not in hidden
+                    ):
                         paths.append(path)
                 if len(paths) >= 2:
                     identifier = entry.get("id")
@@ -1273,13 +1620,18 @@ class LaunchpadWindow(QWidget):
                 continue
             if entry_type == "app":
                 path = entry.get("path")
-                if isinstance(path, str) and path in app_lookup and path not in used:
+                if (
+                    isinstance(path, str)
+                    and path in app_lookup
+                    and path not in used
+                    and path not in hidden
+                ):
                     layout.append(app_lookup[path])
                     used.add(path)
 
         for app in apps:
             path = str(app.desktop_file)
-            if path not in used:
+            if path not in used and path not in hidden:
                 layout.append(app)
 
         return layout
@@ -1288,6 +1640,7 @@ class LaunchpadWindow(QWidget):
         self._close_folder_popup()
         self._folder_buttons.clear()
         self._grids.clear()
+        self._stack.stop_animations()
         while self._stack.count():
             widget = self._stack.widget(0)
             self._stack.removeWidget(widget)
@@ -1333,7 +1686,9 @@ class LaunchpadWindow(QWidget):
                     self._folder_buttons[item.identifier] = button
                 else:
                     button = ApplicationButton(item)
+                    button.hide_requested.connect(self._hide_application)
                 grid_container.add_button(button, row, column)
+            grid_container.set_labels_visible(self._labels_visible)
             self._grids.append(grid_container)
             grid_container.set_max_content_height(self._grid_height_budget())
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
@@ -1365,21 +1720,27 @@ class LaunchpadWindow(QWidget):
         if self._stack.count() <= 1:
             return
         current = self._stack.currentIndex()
-        self._stack.setCurrentIndex((current + 1) % self._stack.count())
-        self._update_page_indicator()
+        self._stack.slide_to_index((current + 1) % self._stack.count(), 1)
 
     def previous_page(self) -> None:
         if self._stack.count() <= 1:
             return
         current = self._stack.currentIndex()
-        self._stack.setCurrentIndex((current - 1) % self._stack.count())
-        self._update_page_indicator()
+        self._stack.slide_to_index((current - 1) % self._stack.count(), -1)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if event.angleDelta().y() < 0:
             self.next_page()
         elif event.angleDelta().y() > 0:
             self.previous_page()
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        toggle_action = menu.addAction("Показывать подписи")
+        toggle_action.setCheckable(True)
+        toggle_action.setChecked(self._labels_visible)
+        toggle_action.toggled.connect(self._set_labels_visible)
+        menu.exec_(event.globalPos())
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if self._handle_search_key(event):
@@ -1403,6 +1764,17 @@ class LaunchpadWindow(QWidget):
         budget = self._grid_height_budget()
         for grid in self._grids:
             grid.set_max_content_height(budget)
+
+    def _set_labels_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._labels_visible == visible:
+            return
+        self._labels_visible = visible
+        for grid in self._grids:
+            grid.set_labels_visible(visible)
+        if self._folder_popup and not sip.isdeleted(self._folder_popup):
+            self._folder_popup.set_labels_visible(visible)
+        _save_label_visibility(visible)
 
     def _handle_search_key(self, event) -> bool:
         modifiers = event.modifiers()
@@ -1431,7 +1803,7 @@ class LaunchpadWindow(QWidget):
         self._search_query = text.strip().lower()
         self._update_filtered_items()
 
-    def _update_page_indicator(self) -> None:
+    def _update_page_indicator(self, _index: int | None = None) -> None:
         self._page_indicator.set_page_count(self._stack.count())
         self._page_indicator.set_current_page(self._stack.currentIndex())
 
@@ -1441,9 +1813,62 @@ class LaunchpadWindow(QWidget):
         else:
             query = self._search_query
             self._filtered_items = [
-                app for app in self._all_apps if query in app.name.lower()
+                app
+                for app in self._all_apps
+                if str(app.desktop_file) not in self._hidden_paths
+                and query in app.name.lower()
             ]
         self._rebuild_pages()
+
+    def _remove_app_from_layout(self, desktop_path: str) -> bool:
+        removed = False
+        updated: List[LayoutItem] = []
+        for item in self._layout_items:
+            if isinstance(item, Application):
+                if str(item.desktop_file) == desktop_path:
+                    removed = True
+                    continue
+                updated.append(item)
+                continue
+
+            if isinstance(item, FolderItem):
+                remaining = [
+                    app for app in item.apps if str(app.desktop_file) != desktop_path
+                ]
+                if len(remaining) == len(item.apps):
+                    updated.append(item)
+                    continue
+                removed = True
+                if len(remaining) == 1:
+                    updated.append(remaining[0])
+                elif remaining:
+                    item.apps = remaining
+                    updated.append(item)
+                continue
+
+            updated.append(item)
+
+        if removed:
+            self._layout_items = updated
+        return removed
+
+    def _hide_application(self, desktop_path: str) -> None:
+        if not isinstance(desktop_path, str):
+            return
+
+        path = desktop_path
+        removed = self._remove_app_from_layout(path)
+        added_to_hidden = False
+        if path not in self._hidden_paths:
+            self._hidden_paths.add(path)
+            added_to_hidden = True
+            _save_hidden_paths(self._hidden_paths)
+
+        if removed:
+            _save_layout(self._layout_items)
+
+        if added_to_hidden or removed:
+            self._update_filtered_items()
 
     def _on_reorder_requested(self, source_key: str, target_key: str, insert_before: bool) -> None:
         if source_key == target_key:
@@ -1567,8 +1992,9 @@ class LaunchpadWindow(QWidget):
 
     def _open_folder_popup(self, folder: FolderItem, anchor_rect: QRect) -> None:
         self._close_folder_popup()
-        popup = FolderPopup(folder, self)
+        popup = FolderPopup(folder, self, labels_visible=self._labels_visible)
         popup.rename_requested.connect(lambda name, fid=folder.identifier: self._on_folder_renamed(fid, name))
+        popup.app_hide_requested.connect(self._hide_application)
         popup.closed.connect(self._on_folder_popup_closed)
         popup.adjustSize()
 
