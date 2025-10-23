@@ -69,6 +69,7 @@ FULL_PAGE_WIDTH = FULL_GRID_WIDTH + PAGE_CONTAINER_MARGIN * 2
 CONFIG_PATH = Path.home() / ".config/lpad/lpad.conf"
 CONFIG_SECTION = "apps"
 CONFIG_KEY = "order"
+CONFIG_HIDDEN_KEY = "hidden"
 CONFIG_UI_SECTION = "ui"
 CONFIG_SHOW_LABELS_KEY = "show_labels"
 DEFAULT_FOLDER_NAME = "Папка"
@@ -241,6 +242,71 @@ def _load_saved_order_paths() -> List[str]:
             if isinstance(path, str):
                 paths.append(path)
     return paths
+
+
+def _load_hidden_paths() -> set[str]:
+    """Return the set of desktop file paths that should stay hidden."""
+
+    if not CONFIG_PATH.exists():
+        return set()
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        return set()
+
+    if not config.has_option(CONFIG_SECTION, CONFIG_HIDDEN_KEY):
+        return set()
+
+    raw_value = config.get(CONFIG_SECTION, CONFIG_HIDDEN_KEY, fallback="").strip()
+    if not raw_value:
+        return set()
+
+    paths: set[str] = set()
+    try:
+        data = json.loads(raw_value)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, str) and entry:
+                paths.add(entry)
+    else:
+        for line in raw_value.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                paths.add(cleaned)
+
+    return paths
+
+
+def _save_hidden_paths(paths: set[str]) -> None:
+    """Persist the provided hidden desktop paths to the config file."""
+
+    config = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except OSError:
+            config = configparser.ConfigParser()
+
+    if CONFIG_SECTION not in config:
+        config[CONFIG_SECTION] = {}
+
+    serialized = json.dumps(sorted(paths), ensure_ascii=False, indent=2) if paths else ""
+    if serialized:
+        config[CONFIG_SECTION][CONFIG_HIDDEN_KEY] = serialized
+    elif CONFIG_HIDDEN_KEY in config[CONFIG_SECTION]:
+        del config[CONFIG_SECTION][CONFIG_HIDDEN_KEY]
+
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            config.write(fh)
+    except OSError:
+        pass
 
 
 def _serialize_layout(items: Sequence[LayoutItem]) -> str:
@@ -603,6 +669,8 @@ class LaunchpadTileButton(QToolButton):
 class ApplicationButton(LaunchpadTileButton):
     """Button representing a single application entry."""
 
+    hide_requested = pyqtSignal(str)
+
     def __init__(self, app: Application, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._app = app
@@ -653,6 +721,13 @@ class ApplicationButton(LaunchpadTileButton):
             "key": self.desktop_path,
             "path": self.desktop_path,
         }
+
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        hide_action = menu.addAction("Скрыть ярлык")
+        chosen = menu.exec_(event.globalPos())
+        if chosen is hide_action:
+            self.hide_requested.emit(self.desktop_path)
 
 
 class FolderButton(LaunchpadTileButton):
@@ -766,6 +841,7 @@ class FolderPopup(QWidget):
 
     rename_requested = pyqtSignal(str)
     closed = pyqtSignal()
+    app_hide_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -854,6 +930,7 @@ class FolderPopup(QWidget):
             column = index % FOLDER_COLUMNS
             self._grid.addWidget(button, row, column)
             button.set_label_visible(self._labels_visible)
+            button.hide_requested.connect(self.app_hide_requested.emit)
             self._app_buttons.append(button)
         self._update_size()
 
@@ -1265,6 +1342,7 @@ class LaunchpadWindow(QWidget):
     def __init__(self, apps: List[Application]) -> None:
         super().__init__()
         self._all_apps = apps
+        self._hidden_paths: set[str] = _load_hidden_paths()
         self._layout_items: List[LayoutItem] = self._build_layout_items(apps)
         self._background = _read_kde_wallpaper()
         self._search_query = ""
@@ -1361,6 +1439,8 @@ class LaunchpadWindow(QWidget):
         used: set[str] = set()
         layout: List[LayoutItem] = []
 
+        hidden = self._hidden_paths
+
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -1368,7 +1448,12 @@ class LaunchpadWindow(QWidget):
             if entry_type == "folder":
                 paths: list[str] = []
                 for path in entry.get("apps", []) or []:
-                    if isinstance(path, str) and path in app_lookup and path not in used:
+                    if (
+                        isinstance(path, str)
+                        and path in app_lookup
+                        and path not in used
+                        and path not in hidden
+                    ):
                         paths.append(path)
                 if len(paths) >= 2:
                     identifier = entry.get("id")
@@ -1388,13 +1473,18 @@ class LaunchpadWindow(QWidget):
                 continue
             if entry_type == "app":
                 path = entry.get("path")
-                if isinstance(path, str) and path in app_lookup and path not in used:
+                if (
+                    isinstance(path, str)
+                    and path in app_lookup
+                    and path not in used
+                    and path not in hidden
+                ):
                     layout.append(app_lookup[path])
                     used.add(path)
 
         for app in apps:
             path = str(app.desktop_file)
-            if path not in used:
+            if path not in used and path not in hidden:
                 layout.append(app)
 
         return layout
@@ -1448,6 +1538,7 @@ class LaunchpadWindow(QWidget):
                     self._folder_buttons[item.identifier] = button
                 else:
                     button = ApplicationButton(item)
+                    button.hide_requested.connect(self._hide_application)
                 grid_container.add_button(button, row, column)
             grid_container.set_labels_visible(self._labels_visible)
             self._grids.append(grid_container)
@@ -1576,9 +1667,62 @@ class LaunchpadWindow(QWidget):
         else:
             query = self._search_query
             self._filtered_items = [
-                app for app in self._all_apps if query in app.name.lower()
+                app
+                for app in self._all_apps
+                if str(app.desktop_file) not in self._hidden_paths
+                and query in app.name.lower()
             ]
         self._rebuild_pages()
+
+    def _remove_app_from_layout(self, desktop_path: str) -> bool:
+        removed = False
+        updated: List[LayoutItem] = []
+        for item in self._layout_items:
+            if isinstance(item, Application):
+                if str(item.desktop_file) == desktop_path:
+                    removed = True
+                    continue
+                updated.append(item)
+                continue
+
+            if isinstance(item, FolderItem):
+                remaining = [
+                    app for app in item.apps if str(app.desktop_file) != desktop_path
+                ]
+                if len(remaining) == len(item.apps):
+                    updated.append(item)
+                    continue
+                removed = True
+                if len(remaining) == 1:
+                    updated.append(remaining[0])
+                elif remaining:
+                    item.apps = remaining
+                    updated.append(item)
+                continue
+
+            updated.append(item)
+
+        if removed:
+            self._layout_items = updated
+        return removed
+
+    def _hide_application(self, desktop_path: str) -> None:
+        if not isinstance(desktop_path, str):
+            return
+
+        path = desktop_path
+        removed = self._remove_app_from_layout(path)
+        added_to_hidden = False
+        if path not in self._hidden_paths:
+            self._hidden_paths.add(path)
+            added_to_hidden = True
+            _save_hidden_paths(self._hidden_paths)
+
+        if removed:
+            _save_layout(self._layout_items)
+
+        if added_to_hidden or removed:
+            self._update_filtered_items()
 
     def _on_reorder_requested(self, source_key: str, target_key: str, insert_before: bool) -> None:
         if source_key == target_key:
@@ -1704,6 +1848,7 @@ class LaunchpadWindow(QWidget):
         self._close_folder_popup()
         popup = FolderPopup(folder, self, labels_visible=self._labels_visible)
         popup.rename_requested.connect(lambda name, fid=folder.identifier: self._on_folder_renamed(fid, name))
+        popup.app_hide_requested.connect(self._hide_application)
         popup.closed.connect(self._on_folder_popup_closed)
         popup.adjustSize()
 
