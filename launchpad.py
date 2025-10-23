@@ -986,6 +986,38 @@ class ApplicationGridWidget(QWidget):
             height = 120
         self._placeholder.setFixedSize(width, height)
 
+    def finalize_reorder(self, source_key: str, target_key: str, insert_before: bool) -> None:
+        """Apply the final ordering after a successful drag-and-drop move."""
+
+        if source_key == target_key:
+            return
+
+        try:
+            source_index = next(
+                index for index, tile in enumerate(self._tiles) if tile.item_key == source_key
+            )
+        except StopIteration:
+            return
+
+        try:
+            target_index = next(
+                index for index, tile in enumerate(self._tiles) if tile.item_key == target_key
+            )
+        except StopIteration:
+            return
+
+        if source_index == target_index:
+            return
+
+        button = self._tiles.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        if not insert_before:
+            target_index += 1
+        target_index = max(0, min(target_index, len(self._tiles)))
+        self._tiles.insert(target_index, button)
+        self._reflow_tiles()
+
     def _reflow_tiles(self) -> None:
         self._stop_animations()
         self.setUpdatesEnabled(False)
@@ -1412,6 +1444,10 @@ class LaunchpadWindow(QWidget):
         if source_key == target_key:
             return
 
+        grid = self.sender()
+        if not isinstance(grid, ApplicationGridWidget):
+            grid = None
+
         source_index, source_item = self._find_item(source_key)
         target_index, _ = self._find_item(target_key)
         if source_index is None or source_item is None or target_index is None:
@@ -1425,7 +1461,16 @@ class LaunchpadWindow(QWidget):
         target_index = max(0, min(target_index, len(self._layout_items)))
         self._layout_items.insert(target_index, item)
         _save_layout(self._layout_items)
-        self._update_filtered_items()
+
+        if self._search_query:
+            self._update_filtered_items()
+            return
+
+        self._filtered_items = list(self._layout_items)
+        if grid is not None:
+            grid.finalize_reorder(source_key, target_key, insert_before)
+        else:
+            self._update_filtered_items()
 
     def _grid_height_budget(self) -> int:
         layout = self.layout()
