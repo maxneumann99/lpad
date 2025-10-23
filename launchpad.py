@@ -31,6 +31,8 @@ from PyQt5.QtCore import (
     QPoint,
     QRect,
     QMimeData,
+    QEasingCurve,
+    QPropertyAnimation,
     pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
@@ -793,6 +795,7 @@ class ApplicationGridWidget(QWidget):
             " border-radius: 26px; background-color: rgba(255, 255, 255, 80);"
         )
         self._placeholder.hide()
+        self._active_animations: list[QPropertyAnimation] = []
         self.setAcceptDrops(True)
 
     def add_button(self, button: LaunchpadTileButton, row: int, column: int) -> None:
@@ -963,6 +966,15 @@ class ApplicationGridWidget(QWidget):
         self._placeholder.setFixedSize(width, height)
 
     def _reflow_tiles(self) -> None:
+        self._stop_animations()
+
+        old_positions: dict[QWidget, QRect] = {}
+        for tile in self._tiles:
+            if tile.isVisible():
+                old_positions[tile] = tile.geometry()
+        if self._placeholder.isVisible():
+            old_positions[self._placeholder] = self._placeholder.geometry()
+
         while self._grid.count():
             self._grid.takeAt(0)
 
@@ -980,8 +992,40 @@ class ApplicationGridWidget(QWidget):
             column = position % APP_COLUMNS
             self._grid.addWidget(widget, row, column)
 
+        self._grid.activate()
+
+        for widget in widgets:
+            if widget is self._placeholder:
+                continue
+            old_rect = old_positions.get(widget)
+            new_rect = widget.geometry()
+            if old_rect is None or old_rect == new_rect:
+                continue
+            widget.setGeometry(old_rect)
+            animation = QPropertyAnimation(widget, b"geometry", self)
+            animation.setDuration(180)
+            animation.setEasingCurve(QEasingCurve.OutCubic)
+            animation.setStartValue(old_rect)
+            animation.setEndValue(new_rect)
+            animation.finished.connect(lambda w=animation: self._on_animation_finished(w))
+            animation.start()
+            self._active_animations.append(animation)
+
         if self._placeholder_index is None:
             self._grid.removeWidget(self._placeholder)
+
+    def _stop_animations(self) -> None:
+        while self._active_animations:
+            animation = self._active_animations.pop()
+            animation.stop()
+            animation.deleteLater()
+
+    def _on_animation_finished(self, animation: QPropertyAnimation) -> None:
+        try:
+            self._active_animations.remove(animation)
+        except ValueError:
+            pass
+        animation.deleteLater()
 
 
 
