@@ -17,6 +17,8 @@ import shlex
 import subprocess
 import sys
 import uuid
+
+import sip
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -447,7 +449,12 @@ class LaunchpadTileButton(QToolButton):
         drag.setPixmap(self.grab())
         drag.setHotSpot(event.pos())
 
-        drag.exec_(Qt.MoveAction)
+        self.hide()
+        try:
+            drag.exec_(Qt.MoveAction)
+        finally:
+            if not sip.isdeleted(self):
+                self.show()
         self._suppress_click = True
         self._drag_start_pos = None
 
@@ -776,6 +783,15 @@ class ApplicationGridWidget(QWidget):
         self._grid.setColumnStretch(APP_COLUMNS, 1)
         self._grid.setRowStretch(APP_ROWS, 1)
         self._tiles: list[LaunchpadTileButton] = []
+        self._placeholder_index: int | None = None
+        self._placeholder = QWidget(self)
+        self._placeholder.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._placeholder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._placeholder.setStyleSheet(
+            "border: 2px dashed rgba(80, 80, 80, 160);"
+            " border-radius: 26px; background-color: rgba(255, 255, 255, 80);"
+        )
+        self._placeholder.hide()
         self.setAcceptDrops(True)
 
     def add_button(self, button: LaunchpadTileButton, row: int, column: int) -> None:
@@ -783,6 +799,7 @@ class ApplicationGridWidget(QWidget):
 
         self._grid.addWidget(button, row, column)
         self._tiles.append(button)
+        self._update_placeholder_size(button)
 
     def dragEnterEvent(self, event):  # type: ignore[override]
         if event.mimeData().hasFormat(LaunchpadTileButton.MIME_TYPE):
@@ -794,9 +811,16 @@ class ApplicationGridWidget(QWidget):
         if not event.mimeData().hasFormat(LaunchpadTileButton.MIME_TYPE):
             super().dragMoveEvent(event)
             return
-        if self._determine_drop_target(event.pos()) is None:
+        target = self._determine_drop_target(event.pos())
+        if target is None:
+            self._clear_placeholder()
             event.ignore()
             return
+        target_button, insert_before, on_icon = target
+        if on_icon:
+            self._clear_placeholder()
+        else:
+            self._show_placeholder(target_button, insert_before)
         event.acceptProposedAction()
 
     def dropEvent(self, event):  # type: ignore[override]
@@ -806,6 +830,7 @@ class ApplicationGridWidget(QWidget):
 
         target = self._determine_drop_target(event.pos())
         if target is None:
+            self._clear_placeholder()
             event.ignore()
             return
 
@@ -817,19 +842,27 @@ class ApplicationGridWidget(QWidget):
 
         source_key = payload.get("key") if isinstance(payload, dict) else None
         if not isinstance(source_key, str):
+            self._clear_placeholder()
             event.ignore()
             return
 
         target_key = target_button.item_key
         if source_key == target_key:
+            self._clear_placeholder()
             event.ignore()
             return
 
         if on_icon:
+            self._clear_placeholder()
             self.merge_requested.emit(payload, target_key)
         else:
             self.reorder_requested.emit(source_key, target_key, insert_before)
+            self._clear_placeholder()
         event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):  # type: ignore[override]
+        self._clear_placeholder()
+        super().dragLeaveEvent(event)
 
     def _determine_drop_target(
         self, position: QPoint
@@ -886,6 +919,68 @@ class ApplicationGridWidget(QWidget):
                 return row_tiles[-1], False, False
 
         return None
+
+    def _visible_tiles(self) -> list[LaunchpadTileButton]:
+        return [tile for tile in self._tiles if tile.isVisible()]
+
+    def _show_placeholder(self, target_button: LaunchpadTileButton, insert_before: bool) -> None:
+        visible = self._visible_tiles()
+        try:
+            target_index = visible.index(target_button)
+        except ValueError:
+            self._clear_placeholder()
+            return
+        index = target_index if insert_before else target_index + 1
+        index = max(0, min(index, len(visible)))
+        if self._placeholder_index == index:
+            return
+        self._placeholder_index = index
+        self._update_placeholder_size()
+        self._reflow_tiles()
+
+    def _clear_placeholder(self) -> None:
+        if self._placeholder_index is None:
+            return
+        self._placeholder_index = None
+        self._reflow_tiles()
+
+    def _update_placeholder_size(self, reference: QWidget | None = None) -> None:
+        if reference is None:
+            for tile in self._tiles:
+                if tile.isVisible():
+                    reference = tile
+                    break
+        if reference is None:
+            return
+        size = reference.sizeHint()
+        width = max(APP_TILE_WIDTH, size.width()) if size.isValid() else APP_TILE_WIDTH
+        height = size.height() if size.isValid() else reference.height()
+        if height <= 0:
+            height = reference.sizeHint().height()
+        if height <= 0:
+            height = 120
+        self._placeholder.setFixedSize(width, height)
+
+    def _reflow_tiles(self) -> None:
+        while self._grid.count():
+            self._grid.takeAt(0)
+
+        visible = self._visible_tiles()
+        if self._placeholder_index is None:
+            self._placeholder.hide()
+            widgets: list[QWidget] = visible
+        else:
+            index = max(0, min(self._placeholder_index, len(visible)))
+            widgets = visible[:index] + [self._placeholder] + visible[index:]
+            self._placeholder.show()
+
+        for position, widget in enumerate(widgets):
+            row = position // APP_COLUMNS
+            column = position % APP_COLUMNS
+            self._grid.addWidget(widget, row, column)
+
+        if self._placeholder_index is None:
+            self._grid.removeWidget(self._placeholder)
 
 
 
