@@ -986,28 +986,30 @@ class ApplicationGridWidget(QWidget):
             height = 120
         self._placeholder.setFixedSize(width, height)
 
-    def finalize_reorder(self, source_key: str, target_key: str, insert_before: bool) -> None:
+    def finalize_reorder(
+        self, source_key: str, target_key: str, insert_before: bool
+    ) -> bool:
         """Apply the final ordering after a successful drag-and-drop move."""
 
         if source_key == target_key:
-            return
+            return False
 
         try:
             source_index = next(
                 index for index, tile in enumerate(self._tiles) if tile.item_key == source_key
             )
         except StopIteration:
-            return
+            return False
 
         try:
             target_index = next(
                 index for index, tile in enumerate(self._tiles) if tile.item_key == target_key
             )
         except StopIteration:
-            return
+            return False
 
         if source_index == target_index:
-            return
+            return False
 
         button = self._tiles.pop(source_index)
         if source_index < target_index:
@@ -1015,8 +1017,11 @@ class ApplicationGridWidget(QWidget):
         if not insert_before:
             target_index += 1
         target_index = max(0, min(target_index, len(self._tiles)))
+        button.show()
+        button.raise_()
         self._tiles.insert(target_index, button)
         self._reflow_tiles()
+        return True
 
     def _reflow_tiles(self) -> None:
         self._stop_animations()
@@ -1467,10 +1472,11 @@ class LaunchpadWindow(QWidget):
             return
 
         self._filtered_items = list(self._layout_items)
-        if grid is not None:
-            grid.finalize_reorder(source_key, target_key, insert_before)
-        else:
-            self._update_filtered_items()
+        if grid is not None and grid.finalize_reorder(
+            source_key, target_key, insert_before
+        ):
+            return
+        self._update_filtered_items()
 
     def _grid_height_budget(self) -> int:
         layout = self.layout()
