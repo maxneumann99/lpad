@@ -39,6 +39,7 @@ APP_ROWS = 5
 APP_COLUMNS = 7
 APPS_PER_PAGE = APP_ROWS * APP_COLUMNS
 APP_TILE_WIDTH = 140
+SEARCH_FIELD_EXTRA_WIDTH = 120
 
 
 @dataclass
@@ -331,12 +332,13 @@ class LaunchpadWindow(QWidget):
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
         self._stack = QStackedWidget()
+        self._stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self._search_field = QLineEdit()
         self._search_field.setPlaceholderText("Поиск приложений")
         self._search_field.setClearButtonEnabled(True)
         self._search_field.setFixedHeight(40)
-        self._search_field.setMaximumWidth(APP_TILE_WIDTH * APP_COLUMNS)
+        self._search_field.setFixedWidth(APP_TILE_WIDTH * APP_COLUMNS + SEARCH_FIELD_EXTRA_WIDTH)
         self._search_field.setStyleSheet(
             "QLineEdit {"
             " padding: 0 18px;"
@@ -368,15 +370,15 @@ class LaunchpadWindow(QWidget):
 
         content_layout = QHBoxLayout()
         content_layout.addWidget(left_button, alignment=Qt.AlignVCenter)
-        content_layout.addWidget(self._stack, stretch=1)
+        content_layout.addWidget(self._stack, stretch=1, alignment=Qt.AlignTop)
         content_layout.addWidget(right_button, alignment=Qt.AlignVCenter)
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(60, 60, 60, 40)
         main_layout.setSpacing(20)
         main_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
-        main_layout.addStretch()
-        main_layout.addLayout(content_layout)
+        main_layout.addSpacing(10)
+        main_layout.addLayout(content_layout, stretch=1)
         main_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
         main_layout.addStretch()
 
@@ -418,9 +420,14 @@ class LaunchpadWindow(QWidget):
         for index in range(0, len(apps), APPS_PER_PAGE):
             page_apps = apps[index : index + APPS_PER_PAGE]
             page_widget = QWidget()
-            grid = QGridLayout(page_widget)
-            grid.setContentsMargins(40, 40, 40, 40)
-            grid.setSpacing(30)
+            page_layout = QVBoxLayout(page_widget)
+            page_layout.setContentsMargins(40, 40, 40, 40)
+            page_layout.setSpacing(0)
+
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(30)
+            grid.setVerticalSpacing(30)
 
             for position, app in enumerate(page_apps):
                 row = position // APP_COLUMNS
@@ -428,15 +435,9 @@ class LaunchpadWindow(QWidget):
                 button = ApplicationButton(app)
                 grid.addWidget(button, row, column)
 
-            # Fill remaining cells with spacers for consistent layout.
-            total_cells = APP_ROWS * APP_COLUMNS
-            for position in range(len(page_apps), total_cells):
-                row = position // APP_COLUMNS
-                column = position % APP_COLUMNS
-                spacer = QWidget()
-                spacer.setFixedWidth(APP_TILE_WIDTH)
-                spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-                grid.addWidget(spacer, row, column)
+            grid.setRowStretch(APP_ROWS, 1)
+            page_layout.addLayout(grid)
+            page_layout.addStretch(1)
 
             self._stack.addWidget(page_widget)
 
