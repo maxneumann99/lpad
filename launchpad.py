@@ -78,6 +78,162 @@ CONFIG_SHOW_LABELS_KEY = "show_labels"
 DEFAULT_FOLDER_NAME = "Папка"
 
 
+_ICON_CACHE: dict[str, Path | None] = {}
+_ICON_SEARCH_ROOTS: list[Path] | None = None
+_ICON_INDEXED_ROOTS: set[Path] = set()
+_ICON_FILE_INDEX: dict[str, Path] = {}
+_ICON_EXTENSIONS = (".png", ".svg", ".xpm")
+
+
+def _icon_search_roots() -> list[Path]:
+    """Return directories that may contain icon files for fallback lookup."""
+
+    global _ICON_SEARCH_ROOTS
+    if _ICON_SEARCH_ROOTS is not None:
+        return _ICON_SEARCH_ROOTS
+
+    roots: list[Path] = []
+
+    def _add_candidate(path: Path) -> None:
+        if path not in roots:
+            roots.append(path)
+
+    home = Path.home()
+    _add_candidate(home / ".icons")
+    _add_candidate(home / ".local/share/icons")
+    _add_candidate(home / ".local/share/pixmaps")
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        _add_candidate(Path(xdg_data_home) / "icons")
+        _add_candidate(Path(xdg_data_home) / "pixmaps")
+
+    data_dirs_env = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    for entry in data_dirs_env.split(":"):
+        if not entry:
+            continue
+        base_path = Path(entry)
+        _add_candidate(base_path / "icons")
+        _add_candidate(base_path / "pixmaps")
+
+    # Common fallbacks used by several distributions
+    _add_candidate(Path("/usr/share/pixmaps"))
+    _add_candidate(Path("/usr/local/share/pixmaps"))
+
+    _ICON_SEARCH_ROOTS = roots
+    return roots
+
+
+def _register_icon_path(root: Path, icon_path: Path) -> None:
+    """Register ``icon_path`` in the lookup index for fast access."""
+
+    lower_name = icon_path.name.lower()
+    _ICON_FILE_INDEX.setdefault(lower_name, icon_path)
+    stem_key = icon_path.stem.lower()
+    _ICON_FILE_INDEX.setdefault(stem_key, icon_path)
+
+    try:
+        relative = icon_path.relative_to(root).as_posix().lower()
+    except ValueError:
+        relative = ""
+    if relative:
+        _ICON_FILE_INDEX.setdefault(relative, icon_path)
+        if "." in relative:
+            rel_base = relative.rsplit(".", 1)[0]
+            if rel_base:
+                _ICON_FILE_INDEX.setdefault(rel_base, icon_path)
+
+
+def _ensure_icon_index_for_root(root: Path) -> None:
+    """Populate the icon index for the provided ``root`` directory."""
+
+    if root in _ICON_INDEXED_ROOTS:
+        return
+    _ICON_INDEXED_ROOTS.add(root)
+
+    try:
+        if not root.exists():
+            return
+    except OSError:
+        return
+
+    try:
+        if root.is_file():
+            _register_icon_path(root.parent, root)
+            return
+    except OSError:
+        return
+
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            _register_icon_path(root, path)
+    except OSError:
+        return
+
+
+def _icon_search_keys(icon_name: str) -> list[str]:
+    """Return normalized lookup keys for a given icon name."""
+
+    name = icon_name.strip()
+    if not name:
+        return []
+
+    base, ext = os.path.splitext(name)
+    candidates: list[str] = [name.lower()]
+
+    if ext:
+        candidates.append(base.lower())
+    else:
+        for suffix in _ICON_EXTENSIONS:
+            candidates.append(f"{name}{suffix}".lower())
+
+    if "/" in name:
+        tail = name.split("/")[-1]
+        if tail:
+            candidates.append(tail.lower())
+            tail_base, tail_ext = os.path.splitext(tail)
+            if tail_ext:
+                candidates.append(tail_base.lower())
+            else:
+                for suffix in _ICON_EXTENSIONS:
+                    candidates.append(f"{tail}{suffix}".lower())
+
+    # Remove duplicates while preserving order
+    seen: set[str] = set()
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
+    return unique_candidates
+
+
+def _find_icon_in_filesystem(icon_name: str) -> Path | None:
+    """Attempt to resolve ``icon_name`` to an existing icon file."""
+
+    normalized = icon_name.strip()
+    if not normalized:
+        return None
+
+    cached = _ICON_CACHE.get(normalized)
+    if normalized in _ICON_CACHE:
+        return cached
+
+    search_keys = _icon_search_keys(normalized)
+    for root in _icon_search_roots():
+        _ensure_icon_index_for_root(root)
+        for key in search_keys:
+            icon_path = _ICON_FILE_INDEX.get(key)
+            if icon_path and icon_path.exists():
+                _ICON_CACHE[normalized] = icon_path
+                return icon_path
+
+    _ICON_CACHE[normalized] = None
+    return None
+
+
 @dataclass
 class Application:
     """A representation of a desktop entry used by the launcher."""
@@ -700,6 +856,9 @@ class ApplicationButton(LaunchpadTileButton):
             icon = QIcon.fromTheme(icon_name)
             if not icon.isNull():
                 return icon
+            filesystem_icon = _find_icon_in_filesystem(icon_name)
+            if filesystem_icon:
+                return QIcon(str(filesystem_icon))
         return QApplication.style().standardIcon(QApplication.style().SP_DesktopIcon)
 
     def _on_clicked(self) -> None:
