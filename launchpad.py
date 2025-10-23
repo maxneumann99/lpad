@@ -42,6 +42,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -68,6 +69,8 @@ FULL_PAGE_WIDTH = FULL_GRID_WIDTH + PAGE_CONTAINER_MARGIN * 2
 CONFIG_PATH = Path.home() / ".config/lpad/lpad.conf"
 CONFIG_SECTION = "apps"
 CONFIG_KEY = "order"
+CONFIG_UI_SECTION = "ui"
+CONFIG_SHOW_LABELS_KEY = "show_labels"
 DEFAULT_FOLDER_NAME = "Папка"
 
 
@@ -283,6 +286,48 @@ def _save_layout(items: Sequence[LayoutItem]) -> None:
         pass
 
 
+def _load_label_visibility(default: bool = True) -> bool:
+    """Return whether application tile captions should be shown."""
+
+    if not CONFIG_PATH.exists():
+        return default
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        return default
+
+    if not config.has_option(CONFIG_UI_SECTION, CONFIG_SHOW_LABELS_KEY):
+        return default
+
+    value = config.get(CONFIG_UI_SECTION, CONFIG_SHOW_LABELS_KEY, fallback="true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _save_label_visibility(visible: bool) -> None:
+    """Persist the preference controlling tile caption visibility."""
+
+    config = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except OSError:
+            config = configparser.ConfigParser()
+
+    if CONFIG_UI_SECTION not in config:
+        config[CONFIG_UI_SECTION] = {}
+
+    config[CONFIG_UI_SECTION][CONFIG_SHOW_LABELS_KEY] = "1" if visible else "0"
+
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            config.write(fh)
+    except OSError:
+        pass
+
+
 def _clean_exec(exec_cmd: str) -> str:
     """Remove field codes (``%f``, ``%u`` …) from ``Exec`` commands."""
 
@@ -408,6 +453,8 @@ class LaunchpadTileButton(QToolButton):
         self._drag_start_pos: QPoint | None = None
         self._suppress_click = False
         self._drag_enabled = True
+        self._label_visible = True
+        self._raw_label_text = ""
         self.setAcceptDrops(False)
 
     def set_drag_enabled(self, enabled: bool) -> None:
@@ -518,6 +565,40 @@ class LaunchpadTileButton(QToolButton):
 
         return "\n".join(lines)
 
+    def set_raw_label_text(self, text: str) -> None:
+        """Store the base label text and refresh the caption."""
+
+        self._raw_label_text = text
+        self._refresh_label_text()
+
+    def raw_label_text(self) -> str:
+        return self._raw_label_text
+
+    def set_label_visible(self, visible: bool) -> None:
+        """Toggle whether the button caption is visible."""
+
+        visible = bool(visible)
+        if self._label_visible == visible:
+            return
+        self._label_visible = visible
+        self._refresh_label_text()
+
+    def label_visible(self) -> bool:
+        return self._label_visible
+
+    def _refresh_label_text(self) -> None:
+        if self._label_visible:
+            self._update_tool_button_style()
+            self.setText(self._format_label(self._raw_label_text))
+        else:
+            self._update_tool_button_style()
+            self.setText("")
+
+    def _update_tool_button_style(self) -> None:
+        desired = Qt.ToolButtonTextUnderIcon if self._label_visible else Qt.ToolButtonIconOnly
+        if self.toolButtonStyle() != desired:
+            self.setToolButtonStyle(desired)
+
 
 class ApplicationButton(LaunchpadTileButton):
     """Button representing a single application entry."""
@@ -537,7 +618,7 @@ class ApplicationButton(LaunchpadTileButton):
             "QToolButton { padding: 10px; text-align: center; }\n"
             "QToolButton::menu-indicator { image: none; }"
         )
-        self.setText(self._format_label(app.name))
+        self.set_raw_label_text(app.name)
         self.clicked.connect(self._on_clicked)
 
     @staticmethod
@@ -594,7 +675,7 @@ class FolderButton(LaunchpadTileButton):
             "QToolButton { padding: 10px; text-align: center; }\n"
             "QToolButton::menu-indicator { image: none; }"
         )
-        self.setText(self._format_label(folder.name))
+        self.set_raw_label_text(folder.name)
         self.clicked.connect(self._on_clicked)
 
     def _update_icon(self) -> None:
@@ -643,7 +724,7 @@ class FolderButton(LaunchpadTileButton):
 
     def set_folder_name(self, name: str) -> None:
         self._folder.name = name
-        self.setText(self._format_label(name))
+        self.set_raw_label_text(name)
 
     def set_folder_apps(self, apps: List[Application]) -> None:
         self._folder.apps = apps
@@ -686,9 +767,17 @@ class FolderPopup(QWidget):
     rename_requested = pyqtSignal(str)
     closed = pyqtSignal()
 
-    def __init__(self, folder: FolderItem, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        folder: FolderItem,
+        parent: QWidget | None = None,
+        *,
+        labels_visible: bool = True,
+    ) -> None:
         super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
         self._folder = folder
+        self._labels_visible = labels_visible
+        self._app_buttons: list[ApplicationButton] = []
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setStyleSheet(
             "background-color: rgba(255, 255, 255, 235);"
@@ -751,6 +840,7 @@ class FolderPopup(QWidget):
         self.rename_requested.emit(new_name)
 
     def _populate_apps(self) -> None:
+        self._app_buttons = []
         while self._grid.count():
             item = self._grid.takeAt(0)
             widget = item.widget()
@@ -763,12 +853,24 @@ class FolderPopup(QWidget):
             row = index // FOLDER_COLUMNS
             column = index % FOLDER_COLUMNS
             self._grid.addWidget(button, row, column)
+            button.set_label_visible(self._labels_visible)
+            self._app_buttons.append(button)
         self._update_size()
 
     def _update_size(self) -> None:
         columns = min(FOLDER_COLUMNS, max(1, len(self._folder.apps)))
         width = columns * APP_TILE_WIDTH + max(0, columns - 1) * 20 + 48
         self.setFixedWidth(width)
+
+    def set_labels_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._labels_visible == visible:
+            return
+        self._labels_visible = visible
+        for button in list(self._app_buttons):
+            if sip.isdeleted(button):
+                continue
+            button.set_label_visible(visible)
 
 
 class ApplicationGridWidget(QWidget):
@@ -813,6 +915,18 @@ class ApplicationGridWidget(QWidget):
         self._tiles.append(button)
         self._update_placeholder_size(button)
         self._reflow_tiles()
+
+    def set_labels_visible(self, visible: bool) -> None:
+        """Show or hide captions for all tiles inside the grid."""
+
+        changed = False
+        for tile in self._tiles:
+            previous = tile.label_visible()
+            tile.set_label_visible(visible)
+            changed = changed or (previous != visible)
+        if changed:
+            self._update_placeholder_size()
+            self._reflow_tiles()
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
         return QSize(FULL_GRID_WIDTH, self._calculated_height())
@@ -1157,6 +1271,7 @@ class LaunchpadWindow(QWidget):
         self._folder_buttons: dict[str, FolderButton] = {}
         self._folder_popup: FolderPopup | None = None
         self._grids: list[ApplicationGridWidget] = []
+        self._labels_visible = _load_label_visibility()
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
@@ -1334,6 +1449,7 @@ class LaunchpadWindow(QWidget):
                 else:
                     button = ApplicationButton(item)
                 grid_container.add_button(button, row, column)
+            grid_container.set_labels_visible(self._labels_visible)
             self._grids.append(grid_container)
             grid_container.set_max_content_height(self._grid_height_budget())
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
@@ -1381,6 +1497,14 @@ class LaunchpadWindow(QWidget):
         elif event.angleDelta().y() > 0:
             self.previous_page()
 
+    def contextMenuEvent(self, event) -> None:  # type: ignore[override]
+        menu = QMenu(self)
+        toggle_action = menu.addAction("Показывать подписи")
+        toggle_action.setCheckable(True)
+        toggle_action.setChecked(self._labels_visible)
+        toggle_action.toggled.connect(self._set_labels_visible)
+        menu.exec_(event.globalPos())
+
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         if self._handle_search_key(event):
             return
@@ -1403,6 +1527,17 @@ class LaunchpadWindow(QWidget):
         budget = self._grid_height_budget()
         for grid in self._grids:
             grid.set_max_content_height(budget)
+
+    def _set_labels_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self._labels_visible == visible:
+            return
+        self._labels_visible = visible
+        for grid in self._grids:
+            grid.set_labels_visible(visible)
+        if self._folder_popup and not sip.isdeleted(self._folder_popup):
+            self._folder_popup.set_labels_visible(visible)
+        _save_label_visibility(visible)
 
     def _handle_search_key(self, event) -> bool:
         modifiers = event.modifiers()
@@ -1567,7 +1702,7 @@ class LaunchpadWindow(QWidget):
 
     def _open_folder_popup(self, folder: FolderItem, anchor_rect: QRect) -> None:
         self._close_folder_popup()
-        popup = FolderPopup(folder, self)
+        popup = FolderPopup(folder, self, labels_visible=self._labels_visible)
         popup.rename_requested.connect(lambda name, fid=folder.identifier: self._on_folder_renamed(fid, name))
         popup.closed.connect(self._on_folder_popup_closed)
         popup.adjustSize()
