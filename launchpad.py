@@ -998,6 +998,8 @@ class ApplicationGridWidget(QWidget):
                 index = max(0, min(self._placeholder_index, len(visible)))
                 widgets = visible[:index] + [self._placeholder] + visible[index:]
                 self._placeholder.show()
+
+            total_widgets = len(widgets)
             row_height = self._row_height()
             rows = math.ceil(total_widgets / APP_COLUMNS) if total_widgets else 0
             spacing_total = max(0, rows - 1) * GRID_VERTICAL_SPACING
@@ -1009,7 +1011,6 @@ class ApplicationGridWidget(QWidget):
                 available = max(1, self._max_content_height - spacing_total)
                 row_height = max(1, min(row_height, available // rows))
             self._placeholder.setFixedHeight(row_height)
-            total_widgets = len(widgets)
             self._update_container_height(total_widgets, row_height)
 
             for position, widget in enumerate(widgets):
