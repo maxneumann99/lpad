@@ -33,6 +33,8 @@ from PyQt5.QtCore import (
     QMimeData,
     QEasingCurve,
     QPropertyAnimation,
+    QParallelAnimationGroup,
+    QAbstractAnimation,
     pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
@@ -46,6 +48,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QStackedWidget,
+    QStackedLayout,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -1335,6 +1338,144 @@ class ApplicationGridWidget(QWidget):
         animation.deleteLater()
 
 
+class SlidingStackedWidget(QStackedWidget):
+    """A ``QStackedWidget`` variant that slides pages horizontally when switching."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setStackingMode(QStackedLayout.StackAll)
+        self._animation: QParallelAnimationGroup | None = None
+        self._pending_index: int | None = None
+        self._animation_duration = 280
+        self.currentChanged.connect(self._ensure_single_visible)
+
+    @property
+    def is_animating(self) -> bool:
+        return bool(
+            self._animation
+            and self._animation.state() == QAbstractAnimation.Running
+        )
+
+    def stop_animations(self) -> None:
+        if not self._animation:
+            return
+        try:
+            self._animation.finished.disconnect(self._on_animation_finished)
+        except TypeError:
+            pass
+        self._animation.stop()
+        self._animation.deleteLater()
+        self._animation = None
+        self._pending_index = None
+        self._reset_widget_positions()
+
+    def slide_to_index(self, index: int, direction: int) -> None:
+        count = self.count()
+        if index < 0 or index >= count:
+            return
+        if index == self.currentIndex():
+            return
+        if self.is_animating:
+            return
+
+        current_widget = self.currentWidget()
+        next_widget = self.widget(index)
+        if current_widget is None or next_widget is None:
+            QStackedWidget.setCurrentIndex(self, index)
+            return
+
+        frame = self.frameRect()
+        start_point = frame.topLeft()
+        width = frame.width()
+        if width <= 0:
+            width = max(self.width(), next_widget.width(), current_widget.width())
+        if width <= 0:
+            QStackedWidget.setCurrentIndex(self, index)
+            return
+
+        offset = QPoint(width, 0)
+        direction = 1 if direction >= 0 else -1
+        if direction > 0:
+            current_end = start_point - offset
+            next_start = start_point + offset
+        else:
+            current_end = start_point + offset
+            next_start = start_point - offset
+
+        next_widget.setVisible(True)
+        next_widget.raise_()
+        next_widget.move(next_start)
+
+        current_anim = QPropertyAnimation(current_widget, b"pos", self)
+        current_anim.setDuration(self._animation_duration)
+        current_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        current_anim.setStartValue(start_point)
+        current_anim.setEndValue(current_end)
+
+        next_anim = QPropertyAnimation(next_widget, b"pos", self)
+        next_anim.setDuration(self._animation_duration)
+        next_anim.setEasingCurve(QEasingCurve.InOutQuad)
+        next_anim.setStartValue(next_start)
+        next_anim.setEndValue(start_point)
+
+        animation_group = QParallelAnimationGroup(self)
+        animation_group.addAnimation(current_anim)
+        animation_group.addAnimation(next_anim)
+        animation_group.finished.connect(self._on_animation_finished)
+
+        self._animation = animation_group
+        self._pending_index = index
+        animation_group.start()
+
+    def addWidget(self, widget: QWidget) -> int:  # type: ignore[override]
+        index = QStackedWidget.addWidget(self, widget)
+        widget.move(self.frameRect().topLeft())
+        widget.setVisible(index == self.currentIndex())
+        return index
+
+    def insertWidget(self, index: int, widget: QWidget) -> int:  # type: ignore[override]
+        index = QStackedWidget.insertWidget(self, index, widget)
+        widget.move(self.frameRect().topLeft())
+        widget.setVisible(index == self.currentIndex())
+        return index
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._reset_widget_positions()
+
+    def _reset_widget_positions(self) -> None:
+        origin = self.frameRect().topLeft()
+        for idx in range(self.count()):
+            widget = self.widget(idx)
+            if widget is None:
+                continue
+            widget.move(origin)
+            widget.setVisible(idx == self.currentIndex())
+
+    def _ensure_single_visible(self, index: int) -> None:
+        if self.is_animating:
+            return
+        self._reset_widget_positions()
+
+    def _on_animation_finished(self) -> None:
+        if not self._animation:
+            return
+        try:
+            self._animation.finished.disconnect(self._on_animation_finished)
+        except TypeError:
+            pass
+        self._animation.deleteLater()
+        self._animation = None
+
+        target_index = self._pending_index
+        self._pending_index = None
+        if target_index is None:
+            self._reset_widget_positions()
+            return
+
+        QStackedWidget.setCurrentIndex(self, target_index)
+        self._reset_widget_positions()
+
 
 class LaunchpadWindow(QWidget):
     """Main fullscreen window containing the paginated application grid."""
@@ -1356,9 +1497,10 @@ class LaunchpadWindow(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
-        self._stack = QStackedWidget()
+        self._stack = SlidingStackedWidget()
         self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self._stack.setFixedWidth(FULL_PAGE_WIDTH)
+        self._stack.currentChanged.connect(self._update_page_indicator)
 
         self._search_field = QLineEdit()
         self._search_field.setPlaceholderText("Поиск приложений")
@@ -1493,6 +1635,7 @@ class LaunchpadWindow(QWidget):
         self._close_folder_popup()
         self._folder_buttons.clear()
         self._grids.clear()
+        self._stack.stop_animations()
         while self._stack.count():
             widget = self._stack.widget(0)
             self._stack.removeWidget(widget)
@@ -1572,15 +1715,13 @@ class LaunchpadWindow(QWidget):
         if self._stack.count() <= 1:
             return
         current = self._stack.currentIndex()
-        self._stack.setCurrentIndex((current + 1) % self._stack.count())
-        self._update_page_indicator()
+        self._stack.slide_to_index((current + 1) % self._stack.count(), 1)
 
     def previous_page(self) -> None:
         if self._stack.count() <= 1:
             return
         current = self._stack.currentIndex()
-        self._stack.setCurrentIndex((current - 1) % self._stack.count())
-        self._update_page_indicator()
+        self._stack.slide_to_index((current - 1) % self._stack.count(), -1)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if event.angleDelta().y() < 0:
@@ -1657,7 +1798,7 @@ class LaunchpadWindow(QWidget):
         self._search_query = text.strip().lower()
         self._update_filtered_items()
 
-    def _update_page_indicator(self) -> None:
+    def _update_page_indicator(self, _index: int | None = None) -> None:
         self._page_indicator.set_page_count(self._stack.count())
         self._page_indicator.set_current_page(self._stack.currentIndex())
 
