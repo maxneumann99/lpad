@@ -2360,6 +2360,13 @@ class LaunchpadWindow(QWidget):
         return None
 
     def _on_merge_requested(self, payload: dict, target_key: str) -> None:
+        stack_index = self._stack.currentIndex()
+        if stack_index < 0:
+            stack_index = 0
+        stack_count = self._stack.count() if hasattr(self._stack, "count") else 0
+        if stack_count > 0:
+            stack_index = min(stack_index, stack_count - 1)
+
         kind = payload.get("kind") if isinstance(payload, dict) else None
         if kind != "app":
             return
@@ -2402,7 +2409,7 @@ class LaunchpadWindow(QWidget):
             return
 
         _save_layout(self._layout_items)
-        self._update_filtered_items(preferred_page=self._stack.currentIndex())
+        self._update_filtered_items(preferred_page=stack_index)
 
     def _on_folder_button_clicked(self, folder_id: str, anchor_rect: QRect) -> None:
         folder = self._find_folder(folder_id)
