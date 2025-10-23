@@ -8,6 +8,7 @@ keyboard arrows, and close the launchpad when an application is launched.
 
 from __future__ import annotations
 
+import configparser
 import math
 import os
 import re
@@ -18,8 +19,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
 
-from PyQt5.QtCore import Qt, QSize, QEvent, QTimer
-from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor
+from PyQt5.QtCore import (
+    Qt,
+    QSize,
+    QEvent,
+    QTimer,
+    QPoint,
+    QMimeData,
+    pyqtSignal,
+)
+from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -46,6 +55,11 @@ PAGE_CONTAINER_MARGIN = 40
 
 FULL_GRID_WIDTH = APP_TILE_WIDTH * APP_COLUMNS + GRID_HORIZONTAL_SPACING * (APP_COLUMNS - 1)
 FULL_PAGE_WIDTH = FULL_GRID_WIDTH + PAGE_CONTAINER_MARGIN * 2
+
+
+CONFIG_PATH = Path.home() / ".config/lpad/lpad.conf"
+CONFIG_SECTION = "apps"
+CONFIG_KEY = "order"
 
 
 @dataclass
@@ -123,7 +137,65 @@ def load_applications() -> List[Application]:
             apps.append(app)
 
     apps.sort(key=lambda item: item.name.lower())
+    saved_order = _load_saved_order_paths()
+    if saved_order:
+        app_by_path = {str(app.desktop_file): app for app in apps}
+        used_paths: set[str] = set()
+        ordered_apps: List[Application] = []
+        for path in saved_order:
+            app = app_by_path.get(path)
+            if app and path not in used_paths:
+                ordered_apps.append(app)
+                used_paths.add(path)
+        if ordered_apps:
+            ordered_apps.extend(
+                [app for app in apps if str(app.desktop_file) not in used_paths]
+            )
+            apps = ordered_apps
     return apps
+
+
+def _load_saved_order_paths() -> List[str]:
+    """Return a list of desktop file paths representing stored app order."""
+
+    if not CONFIG_PATH.exists():
+        return []
+
+    config = configparser.ConfigParser()
+    try:
+        config.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        return []
+
+    if not config.has_option(CONFIG_SECTION, CONFIG_KEY):
+        return []
+
+    value = config.get(CONFIG_SECTION, CONFIG_KEY, fallback="")
+    return [line.strip() for line in value.splitlines() if line.strip()]
+
+
+def _save_app_order(apps: List[Application]) -> None:
+    """Persist the current order of applications to the config file."""
+
+    config = configparser.ConfigParser()
+    if CONFIG_PATH.exists():
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except OSError:
+            config = configparser.ConfigParser()
+
+    if CONFIG_SECTION not in config:
+        config[CONFIG_SECTION] = {}
+
+    config[CONFIG_SECTION][CONFIG_KEY] = "\n".join(str(app.desktop_file) for app in apps)
+
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            config.write(fh)
+    except OSError:
+        # Failing to persist the order is non-critical; ignore errors silently.
+        pass
 
 
 def _clean_exec(exec_cmd: str) -> str:
@@ -244,9 +316,13 @@ class PageIndicator(QWidget):
 class ApplicationButton(QToolButton):
     """Button representing a single application entry."""
 
+    reorder_requested = pyqtSignal(str, str, bool)
+
     def __init__(self, app: Application, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._app = app
+        self._drag_start_pos: QPoint | None = None
+        self._suppress_click = False
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         self.setIcon(self._create_icon(app.icon_name))
         self.setIconSize(QSize(64, 64))
@@ -261,6 +337,7 @@ class ApplicationButton(QToolButton):
         )
         self.setText(self._format_label(app.name))
         self.clicked.connect(self._on_clicked)
+        self.setAcceptDrops(True)
 
     @staticmethod
     def _create_icon(icon_name: str) -> QIcon:
@@ -277,6 +354,66 @@ class ApplicationButton(QToolButton):
         window = self.window()
         if window:
             window.close()
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._suppress_click = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        if not (event.buttons() & Qt.LeftButton) or self._drag_start_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            super().mouseMoveEvent(event)
+            return
+
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setData(
+            "application/x-launchpad-app",
+            str(self._app.desktop_file).encode("utf-8"),
+        )
+        drag.setMimeData(mime_data)
+        drag.setPixmap(self.grab())
+        drag.setHotSpot(event.pos())
+
+        drag.exec_(Qt.MoveAction)
+        self._suppress_click = True
+        self._drag_start_pos = None
+
+    def mouseReleaseEvent(self, event):  # type: ignore[override]
+        if self._suppress_click:
+            event.accept()
+            self._suppress_click = False
+            self._drag_start_pos = None
+            return
+        super().mouseReleaseEvent(event)
+        self._drag_start_pos = None
+
+    def dragEnterEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-launchpad-app"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # type: ignore[override]
+        if event.mimeData().hasFormat("application/x-launchpad-app"):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):  # type: ignore[override]
+        if not event.mimeData().hasFormat("application/x-launchpad-app"):
+            super().dropEvent(event)
+            return
+        source_path = bytes(event.mimeData().data("application/x-launchpad-app")).decode("utf-8")
+        target_path = str(self._app.desktop_file)
+        if source_path and source_path != target_path:
+            insert_before = event.pos().x() < (self.width() // 2)
+            self.reorder_requested.emit(source_path, target_path, insert_before)
+        event.acceptProposedAction()
 
     def _format_label(self, text: str) -> str:
         """Return the button label wrapped to fit within the tile width."""
@@ -331,6 +468,7 @@ class LaunchpadWindow(QWidget):
         super().__init__()
         self._apps = apps
         self._background = _read_kde_wallpaper()
+        self._search_query = ""
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
@@ -360,8 +498,8 @@ class LaunchpadWindow(QWidget):
         self._search_field.textChanged.connect(self._on_search_text_changed)
         self._search_field.installEventFilter(self)
 
-        self._filtered_apps: List[Application] = list(apps)
-        self._rebuild_pages()
+        self._filtered_apps: List[Application] = []
+        self._update_filtered_apps()
 
         left_button = QPushButton("◀")
         right_button = QPushButton("▶")
@@ -455,6 +593,7 @@ class LaunchpadWindow(QWidget):
                 row = position // APP_COLUMNS
                 column = position % APP_COLUMNS
                 button = ApplicationButton(app)
+                button.reorder_requested.connect(self._on_reorder_requested)
                 grid.addWidget(button, row, column)
 
             grid.setColumnStretch(APP_COLUMNS, 1)
@@ -545,16 +684,39 @@ class LaunchpadWindow(QWidget):
         return False
 
     def _on_search_text_changed(self, text: str) -> None:
-        query = text.strip().lower()
-        if not query:
-            self._filtered_apps = list(self._apps)
-        else:
-            self._filtered_apps = [app for app in self._apps if query in app.name.lower()]
-        self._rebuild_pages()
+        self._search_query = text.strip().lower()
+        self._update_filtered_apps()
 
     def _update_page_indicator(self) -> None:
         self._page_indicator.set_page_count(self._stack.count())
         self._page_indicator.set_current_page(self._stack.currentIndex())
+
+    def _update_filtered_apps(self) -> None:
+        if not self._search_query:
+            self._filtered_apps = list(self._apps)
+        else:
+            query = self._search_query
+            self._filtered_apps = [app for app in self._apps if query in app.name.lower()]
+        self._rebuild_pages()
+
+    def _on_reorder_requested(self, source_path: str, target_path: str, insert_before: bool) -> None:
+        index_lookup = {str(app.desktop_file): idx for idx, app in enumerate(self._apps)}
+        source_index = index_lookup.get(source_path)
+        target_index = index_lookup.get(target_path)
+        if source_index is None or target_index is None:
+            return
+        if source_index == target_index:
+            return
+
+        app = self._apps.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        if not insert_before:
+            target_index += 1
+        target_index = max(0, min(target_index, len(self._apps)))
+        self._apps.insert(target_index, app)
+        _save_app_order(self._apps)
+        self._update_filtered_apps()
 
 
 def main() -> None:
