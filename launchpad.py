@@ -228,6 +228,7 @@ class ApplicationButton(QToolButton):
         self.setAutoRaise(False)
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedWidth(APP_TILE_WIDTH)
+        self.setFocusPolicy(Qt.NoFocus)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setStyleSheet(
             "QToolButton { padding: 10px; text-align: center; }\n"
@@ -273,6 +274,7 @@ class LaunchpadWindow(QWidget):
         right_button = QPushButton("▶")
         for button in (left_button, right_button):
             button.setFixedSize(60, 60)
+            button.setFocusPolicy(Qt.NoFocus)
             button.setStyleSheet(
                 "background-color: rgba(0, 0, 0, 0.4); color: white; border: none; border-radius: 30px;"
             )
@@ -294,6 +296,7 @@ class LaunchpadWindow(QWidget):
         main_layout.addStretch()
 
         self._update_page_indicator()
+        self.setFocus()
 
     def _create_pages(self) -> None:
         for index in range(0, len(self._apps), APPS_PER_PAGE):
