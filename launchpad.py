@@ -1662,7 +1662,7 @@ class LaunchpadWindow(QWidget):
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
         self._stack = SlidingStackedWidget()
-        self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self._stack.setFixedWidth(FULL_PAGE_WIDTH)
         self._stack.currentChanged.connect(self._update_page_indicator)
 
@@ -1705,19 +1705,29 @@ class LaunchpadWindow(QWidget):
         content_layout.addStretch(1)
         content_layout.addWidget(left_button, alignment=Qt.AlignVCenter)
         content_layout.addSpacing(10)
-        content_layout.addWidget(self._stack, alignment=Qt.AlignTop)
+        content_layout.addWidget(self._stack, alignment=Qt.AlignVCenter)
         content_layout.addSpacing(10)
         content_layout.addWidget(right_button, alignment=Qt.AlignVCenter)
         content_layout.addStretch(1)
 
+        self._content_container = QWidget()
+        self._content_container.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.MinimumExpanding
+        )
+        container_layout = QVBoxLayout(self._content_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(20)
+        container_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
+        container_layout.addSpacing(10)
+        container_layout.addLayout(content_layout, stretch=1)
+        container_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(60, 60, 60, 40)
-        main_layout.setSpacing(20)
-        main_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
-        main_layout.addSpacing(10)
-        main_layout.addLayout(content_layout, stretch=1)
-        main_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
-        main_layout.addStretch()
+        main_layout.setSpacing(0)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self._content_container, alignment=Qt.AlignHCenter)
+        main_layout.addStretch(1)
 
         self._update_page_indicator()
         QTimer.singleShot(0, self._search_field.setFocus)
@@ -1851,7 +1861,8 @@ class LaunchpadWindow(QWidget):
             self._grids.append(grid_container)
             grid_container.set_max_content_height(self._grid_height_budget())
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
-            page_layout.addWidget(grid_container, alignment=Qt.AlignTop | Qt.AlignLeft)
+            page_layout.addStretch(1)
+            page_layout.addWidget(grid_container, alignment=Qt.AlignHCenter)
             page_layout.addStretch(1)
 
             self._stack.addWidget(page_widget)
@@ -2070,13 +2081,22 @@ class LaunchpadWindow(QWidget):
         available = self.height() - margins.top() - margins.bottom()
         if available <= 0:
             return 0
-        spacing = max(0, layout.spacing())
+        container_widget = getattr(self, "_content_container", None)
+        if isinstance(container_widget, QWidget):
+            container_layout = container_widget.layout()
+        else:
+            container_layout = None
+        spacing = 0
+        if isinstance(container_layout, QVBoxLayout):
+            spacing = max(0, container_layout.spacing())
         search_height = self._search_field.height() or self._search_field.sizeHint().height()
-        indicator_height = self._page_indicator.sizeHint().height()
+        indicator_height = (
+            self._page_indicator.height() or self._page_indicator.sizeHint().height()
+        )
         available -= search_height
         available -= indicator_height
         available -= 10
-        available -= spacing * 4
+        available -= spacing * 2
         available -= 2 * PAGE_CONTAINER_MARGIN
         return max(0, available)
 
