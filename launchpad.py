@@ -967,52 +967,56 @@ class ApplicationGridWidget(QWidget):
 
     def _reflow_tiles(self) -> None:
         self._stop_animations()
+        self.setUpdatesEnabled(False)
+        try:
+            old_positions: dict[QWidget, QRect] = {}
+            for tile in self._tiles:
+                if tile.isVisible():
+                    old_positions[tile] = tile.geometry()
+            if self._placeholder.isVisible():
+                old_positions[self._placeholder] = self._placeholder.geometry()
 
-        old_positions: dict[QWidget, QRect] = {}
-        for tile in self._tiles:
-            if tile.isVisible():
-                old_positions[tile] = tile.geometry()
-        if self._placeholder.isVisible():
-            old_positions[self._placeholder] = self._placeholder.geometry()
+            while self._grid.count():
+                self._grid.takeAt(0)
 
-        while self._grid.count():
-            self._grid.takeAt(0)
+            visible = self._visible_tiles()
+            if self._placeholder_index is None:
+                self._placeholder.hide()
+                widgets: list[QWidget] = visible
+            else:
+                index = max(0, min(self._placeholder_index, len(visible)))
+                widgets = visible[:index] + [self._placeholder] + visible[index:]
+                self._placeholder.show()
 
-        visible = self._visible_tiles()
-        if self._placeholder_index is None:
-            self._placeholder.hide()
-            widgets: list[QWidget] = visible
-        else:
-            index = max(0, min(self._placeholder_index, len(visible)))
-            widgets = visible[:index] + [self._placeholder] + visible[index:]
-            self._placeholder.show()
+            for position, widget in enumerate(widgets):
+                row = position // APP_COLUMNS
+                column = position % APP_COLUMNS
+                self._grid.addWidget(widget, row, column)
 
-        for position, widget in enumerate(widgets):
-            row = position // APP_COLUMNS
-            column = position % APP_COLUMNS
-            self._grid.addWidget(widget, row, column)
+            self._grid.activate()
 
-        self._grid.activate()
+            for widget in widgets:
+                if widget is self._placeholder:
+                    continue
+                old_rect = old_positions.get(widget)
+                new_rect = widget.geometry()
+                if old_rect is None or old_rect == new_rect:
+                    continue
+                widget.setGeometry(old_rect)
+                animation = QPropertyAnimation(widget, b"geometry", self)
+                animation.setDuration(180)
+                animation.setEasingCurve(QEasingCurve.OutCubic)
+                animation.setStartValue(old_rect)
+                animation.setEndValue(new_rect)
+                animation.finished.connect(lambda w=animation: self._on_animation_finished(w))
+                animation.start()
+                self._active_animations.append(animation)
 
-        for widget in widgets:
-            if widget is self._placeholder:
-                continue
-            old_rect = old_positions.get(widget)
-            new_rect = widget.geometry()
-            if old_rect is None or old_rect == new_rect:
-                continue
-            widget.setGeometry(old_rect)
-            animation = QPropertyAnimation(widget, b"geometry", self)
-            animation.setDuration(180)
-            animation.setEasingCurve(QEasingCurve.OutCubic)
-            animation.setStartValue(old_rect)
-            animation.setEndValue(new_rect)
-            animation.finished.connect(lambda w=animation: self._on_animation_finished(w))
-            animation.start()
-            self._active_animations.append(animation)
-
-        if self._placeholder_index is None:
-            self._grid.removeWidget(self._placeholder)
+            if self._placeholder_index is None:
+                self._grid.removeWidget(self._placeholder)
+        finally:
+            self.setUpdatesEnabled(True)
+            self.update()
 
     def _stop_animations(self) -> None:
         while self._active_animations:
