@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 from PyQt5.QtCore import Qt, QSize
-from PyQt5.QtGui import QIcon, QPainter, QPixmap
+from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
 APP_ROWS = 5
 APP_COLUMNS = 7
 APPS_PER_PAGE = APP_ROWS * APP_COLUMNS
+APP_TILE_WIDTH = 140
 
 
 @dataclass
@@ -203,8 +204,11 @@ class PageIndicator(QWidget):
         start_x = (self.width() - total_width) // 2
         y = self.height() // 2
 
+        active_color = QColor(45, 45, 45)
+        inactive_color = QColor(210, 210, 210)
+
         for index in range(self._page_count):
-            color = Qt.white if index == self._current_page else Qt.lightGray
+            color = active_color if index == self._current_page else inactive_color
             painter.setBrush(color)
             painter.setPen(Qt.NoPen)
             x = start_x + index * spacing
@@ -223,6 +227,12 @@ class ApplicationButton(QToolButton):
         self.setIconSize(QSize(64, 64))
         self.setAutoRaise(False)
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedWidth(APP_TILE_WIDTH)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setStyleSheet(
+            "QToolButton { padding: 10px; text-align: center; }\n"
+            "QToolButton::menu-indicator { image: none; }"
+        )
         self.clicked.connect(self._on_clicked)
 
     @staticmethod
@@ -297,7 +307,6 @@ class LaunchpadWindow(QWidget):
                 row = position // APP_COLUMNS
                 column = position % APP_COLUMNS
                 button = ApplicationButton(app)
-                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 grid.addWidget(button, row, column)
 
             # Fill remaining cells with spacers for consistent layout.
@@ -306,7 +315,8 @@ class LaunchpadWindow(QWidget):
                 row = position // APP_COLUMNS
                 column = position % APP_COLUMNS
                 spacer = QWidget()
-                spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                spacer.setFixedWidth(APP_TILE_WIDTH)
+                spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
                 grid.addWidget(spacer, row, column)
 
             self._stack.addWidget(page_widget)
