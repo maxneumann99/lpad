@@ -8,6 +8,9 @@ keyboard arrows, and close the launchpad when an application is launched.
 
 from __future__ import annotations
 
+import argparse
+import atexit
+
 import configparser
 import json
 import math
@@ -35,9 +38,11 @@ from PyQt5.QtCore import (
     QPropertyAnimation,
     QParallelAnimationGroup,
     QAbstractAnimation,
+    QObject,
     pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QPainter, QPixmap, QColor, QDrag
+from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import (
     QApplication,
     QGridLayout,
@@ -76,6 +81,308 @@ CONFIG_HIDDEN_KEY = "hidden"
 CONFIG_UI_SECTION = "ui"
 CONFIG_SHOW_LABELS_KEY = "show_labels"
 DEFAULT_FOLDER_NAME = "Папка"
+
+
+_ICON_CACHE: dict[str, Path | None] = {}
+_ICON_SEARCH_ROOTS: list[Path] | None = None
+_ICON_INDEXED_ROOTS: set[Path] = set()
+_ICON_ROOT_DIRECTORIES: dict[Path, list[Path]] = {}
+_ICON_FILE_INDEX: dict[str, Path] = {}
+_ICON_EXTENSIONS = (".png", ".svg", ".xpm")
+
+_DEFAULT_ICON_SUBDIRS = (
+    "apps",
+    "actions",
+    "categories",
+    "devices",
+    "emblems",
+    "mimetypes",
+    "places",
+    "status",
+)
+
+
+DEFAULT_CONTROL_SOCKET = Path.home() / ".local/run/lpad-ui.sock"
+
+
+def _icon_search_roots() -> list[Path]:
+    """Return directories that may contain icon files for fallback lookup."""
+
+    global _ICON_SEARCH_ROOTS
+    if _ICON_SEARCH_ROOTS is not None:
+        return _ICON_SEARCH_ROOTS
+
+    roots: list[Path] = []
+
+    def _add_candidate(path: Path) -> None:
+        if path not in roots:
+            roots.append(path)
+
+    home = Path.home()
+    _add_candidate(home / ".icons")
+    _add_candidate(home / ".local/share/icons")
+    _add_candidate(home / ".local/share/pixmaps")
+
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        _add_candidate(Path(xdg_data_home) / "icons")
+        _add_candidate(Path(xdg_data_home) / "pixmaps")
+
+    data_dirs_env = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
+    for entry in data_dirs_env.split(":"):
+        if not entry:
+            continue
+        base_path = Path(entry)
+        _add_candidate(base_path / "icons")
+        _add_candidate(base_path / "pixmaps")
+
+    # Common fallbacks used by several distributions
+    _add_candidate(Path("/usr/share/pixmaps"))
+    _add_candidate(Path("/usr/local/share/pixmaps"))
+
+    _ICON_SEARCH_ROOTS = roots
+    return roots
+
+
+def _register_icon_path(root: Path, icon_path: Path) -> None:
+    """Register ``icon_path`` in the lookup index for fast access."""
+
+    lower_name = icon_path.name.lower()
+    _ICON_FILE_INDEX.setdefault(lower_name, icon_path)
+    stem_key = icon_path.stem.lower()
+    _ICON_FILE_INDEX.setdefault(stem_key, icon_path)
+
+    try:
+        relative = icon_path.relative_to(root).as_posix().lower()
+    except ValueError:
+        relative = ""
+    if relative:
+        _ICON_FILE_INDEX.setdefault(relative, icon_path)
+        if "." in relative:
+            rel_base = relative.rsplit(".", 1)[0]
+            if rel_base:
+                _ICON_FILE_INDEX.setdefault(rel_base, icon_path)
+
+
+def _parse_icon_theme_directories(theme_root: Path) -> list[Path]:
+    """Return candidate subdirectories listed by ``index.theme`` if present."""
+
+    index_path = theme_root / "index.theme"
+    try:
+        if not index_path.exists():
+            return []
+    except OSError:
+        return []
+
+    parser = configparser.ConfigParser()
+    try:
+        with index_path.open("r", encoding="utf-8", errors="replace") as fh:
+            parser.read_file(fh)
+    except (OSError, configparser.Error):
+        return []
+
+    directories_value = parser.get("Icon Theme", "Directories", fallback="")
+    if not directories_value:
+        return []
+
+    entries = re.split(r"[;,]", directories_value)
+    candidates: list[Path] = []
+    for entry in entries:
+        cleaned = entry.strip()
+        if not cleaned:
+            continue
+        candidate = (theme_root / cleaned).resolve()
+        candidates.append(candidate)
+    return candidates
+
+
+def _ensure_icon_index_for_root(root: Path) -> None:
+    """Populate the icon index for the provided ``root`` directory."""
+
+    if root in _ICON_INDEXED_ROOTS:
+        return
+    _ICON_INDEXED_ROOTS.add(root)
+
+    try:
+        if not root.exists():
+            _ICON_ROOT_DIRECTORIES[root] = []
+            return
+    except OSError:
+        _ICON_ROOT_DIRECTORIES[root] = []
+        return
+
+    try:
+        if root.is_file():
+            _register_icon_path(root.parent, root)
+            _ICON_ROOT_DIRECTORIES[root] = []
+            return
+    except OSError:
+        _ICON_ROOT_DIRECTORIES[root] = []
+        return
+
+    directories: list[Path] = []
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            if path.exists():
+                directories.append(path)
+        except OSError:
+            return
+
+    _add_candidate(root)
+
+    try:
+        for child in root.iterdir():
+            if child.is_file():
+                _register_icon_path(root, child)
+                continue
+            if not child.is_dir():
+                continue
+            _add_candidate(child)
+            for candidate in _parse_icon_theme_directories(child):
+                _add_candidate(candidate)
+            for subdir in _DEFAULT_ICON_SUBDIRS:
+                _add_candidate(child / subdir)
+    except OSError:
+        pass
+
+    for candidate in _parse_icon_theme_directories(root):
+        _add_candidate(candidate)
+
+    for subdir in _DEFAULT_ICON_SUBDIRS:
+        _add_candidate(root / subdir)
+
+    # De-duplicate while preserving order
+    seen: set[Path] = set()
+    unique_directories: list[Path] = []
+    for directory in directories:
+        resolved = directory
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_directories.append(directory)
+
+    _ICON_ROOT_DIRECTORIES[root] = unique_directories
+
+
+def _locate_icon_in_root(root: Path, key: str) -> Path | None:
+    """Return a matching icon path inside ``root`` for ``key`` if available."""
+
+    try:
+        key_path = Path(key)
+    except OSError:
+        key_path = None
+
+    if key_path and key_path.is_absolute():
+        try:
+            if key_path.exists():
+                return key_path
+        except OSError:
+            return None
+        return None
+
+    # Allow icon names that already include theme-relative directories
+    if key_path and len(key_path.parts) > 1:
+        candidate = root / key_path
+        try:
+            if candidate.exists():
+                return candidate
+        except OSError:
+            pass
+
+    for directory in _ICON_ROOT_DIRECTORIES.get(root, []):
+        try:
+            candidate = directory / key
+            if candidate.exists():
+                return candidate
+        except OSError:
+            continue
+
+    return None
+
+
+def _icon_search_keys(icon_name: str) -> list[str]:
+    """Return normalized lookup keys for a given icon name."""
+
+    name = icon_name.strip()
+    if not name:
+        return []
+
+    base, ext = os.path.splitext(name)
+    candidates: list[str] = [name.lower()]
+
+    if ext:
+        candidates.append(base.lower())
+    else:
+        for suffix in _ICON_EXTENSIONS:
+            candidates.append(f"{name}{suffix}".lower())
+
+    if "/" in name:
+        tail = name.split("/")[-1]
+        if tail:
+            candidates.append(tail.lower())
+            tail_base, tail_ext = os.path.splitext(tail)
+            if tail_ext:
+                candidates.append(tail_base.lower())
+            else:
+                for suffix in _ICON_EXTENSIONS:
+                    candidates.append(f"{tail}{suffix}".lower())
+
+    # Remove duplicates while preserving order
+    seen: set[str] = set()
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            unique_candidates.append(candidate)
+            seen.add(candidate)
+    return unique_candidates
+
+
+def _find_icon_in_filesystem(icon_name: str) -> Path | None:
+    """Attempt to resolve ``icon_name`` to an existing icon file."""
+
+    normalized = icon_name.strip()
+    if not normalized:
+        return None
+
+    try:
+        absolute_candidate = Path(normalized)
+        if absolute_candidate.is_absolute():
+            if absolute_candidate.exists():
+                _ICON_CACHE[normalized] = absolute_candidate
+                _register_icon_path(absolute_candidate.parent, absolute_candidate)
+                return absolute_candidate
+            _ICON_CACHE[normalized] = None
+            return None
+    except OSError:
+        pass
+
+    cached = _ICON_CACHE.get(normalized)
+    if normalized in _ICON_CACHE:
+        return cached
+
+    search_keys = _icon_search_keys(normalized)
+    for key in search_keys:
+        icon_path = _ICON_FILE_INDEX.get(key)
+        try:
+            if icon_path and icon_path.exists():
+                _ICON_CACHE[normalized] = icon_path
+                return icon_path
+        except OSError:
+            continue
+
+    for root in _icon_search_roots():
+        _ensure_icon_index_for_root(root)
+        for key in search_keys:
+            icon_path = _locate_icon_in_root(root, key)
+            if icon_path is None:
+                continue
+            _register_icon_path(root, icon_path)
+            _ICON_CACHE[normalized] = icon_path
+            return icon_path
+
+    _ICON_CACHE[normalized] = None
+    return None
 
 
 @dataclass
@@ -700,6 +1007,9 @@ class ApplicationButton(LaunchpadTileButton):
             icon = QIcon.fromTheme(icon_name)
             if not icon.isNull():
                 return icon
+            filesystem_icon = _find_icon_in_filesystem(icon_name)
+            if filesystem_icon:
+                return QIcon(str(filesystem_icon))
         return QApplication.style().standardIcon(QApplication.style().SP_DesktopIcon)
 
     def _on_clicked(self) -> None:
@@ -1485,7 +1795,10 @@ class SlidingStackedWidget(QStackedWidget):
 class LaunchpadWindow(QWidget):
     """Main fullscreen window containing the paginated application grid."""
 
-    def __init__(self, apps: List[Application]) -> None:
+    shown = pyqtSignal()
+    hidden = pyqtSignal()
+
+    def __init__(self, apps: List[Application], *, resident: bool = False) -> None:
         super().__init__()
         self._all_apps = apps
         self._hidden_paths: set[str] = _load_hidden_paths()
@@ -1496,14 +1809,20 @@ class LaunchpadWindow(QWidget):
         self._folder_popup: FolderPopup | None = None
         self._grids: list[ApplicationGridWidget] = []
         self._labels_visible = _load_label_visibility()
+        self._resident = resident
+        self._prewarmed = False
+        self._suspend_auto_close = False
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
-        self.setAttribute(Qt.WA_DeleteOnClose)
+        if not self._resident:
+            self.setAttribute(Qt.WA_DeleteOnClose)
+        else:
+            self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._page_indicator = PageIndicator(max(1, math.ceil(len(apps) / APPS_PER_PAGE)))
         self._stack = SlidingStackedWidget()
-        self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self._stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self._stack.setFixedWidth(FULL_PAGE_WIDTH)
         self._stack.currentChanged.connect(self._update_page_indicator)
 
@@ -1527,7 +1846,7 @@ class LaunchpadWindow(QWidget):
         self._search_field.installEventFilter(self)
 
         self._filtered_items: List[LayoutItem] = []
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=0)
 
         left_button = QPushButton("◀")
         right_button = QPushButton("▶")
@@ -1546,28 +1865,76 @@ class LaunchpadWindow(QWidget):
         content_layout.addStretch(1)
         content_layout.addWidget(left_button, alignment=Qt.AlignVCenter)
         content_layout.addSpacing(10)
-        content_layout.addWidget(self._stack, alignment=Qt.AlignTop)
+        content_layout.addWidget(self._stack, alignment=Qt.AlignVCenter)
         content_layout.addSpacing(10)
         content_layout.addWidget(right_button, alignment=Qt.AlignVCenter)
         content_layout.addStretch(1)
 
+        self._content_container = QWidget()
+        self._content_container.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.MinimumExpanding
+        )
+        container_layout = QVBoxLayout(self._content_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(20)
+        container_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
+        container_layout.addSpacing(10)
+        container_layout.addLayout(content_layout, stretch=1)
+        container_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
+
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(60, 60, 60, 40)
-        main_layout.setSpacing(20)
-        main_layout.addWidget(self._search_field, alignment=Qt.AlignHCenter)
-        main_layout.addSpacing(10)
-        main_layout.addLayout(content_layout, stretch=1)
-        main_layout.addWidget(self._page_indicator, alignment=Qt.AlignCenter)
-        main_layout.addStretch()
+        main_layout.setSpacing(0)
+        main_layout.addStretch(1)
+        main_layout.addWidget(self._content_container, alignment=Qt.AlignHCenter)
+        main_layout.addStretch(1)
 
         self._update_page_indicator()
         QTimer.singleShot(0, self._search_field.setFocus)
+
+    def show_launchpad(self) -> None:
+        """Present the launchpad window on screen."""
+
+        if self._resident and not self._prewarmed:
+            self.prewarm_for_resident()
+        self.showFullScreen()
+        self.raise_()
+        self.activateWindow()
+        QTimer.singleShot(0, self._search_field.setFocus)
+        self.shown.emit()
+
+    def hide_launchpad(self) -> None:
+        """Hide the launchpad window while keeping the process alive."""
+
+        if not self._resident:
+            self.close()
+            return
+        self._reset_after_hide()
+        self.hide()
+        self.hidden.emit()
+
+    def _reset_after_hide(self) -> None:
+        """Restore default layout state when the window is dismissed."""
+
+        self._close_folder_popup()
+        if self._search_field.text():
+            self._search_field.setText("")
+        else:
+            self._search_query = ""
+            self._filtered_items = list(self._layout_items)
+            self._rebuild_pages()
+        if self._stack.count():
+            self._stack.setCurrentIndex(0)
+        self._update_page_indicator()
 
     def eventFilter(self, obj, event):
         if obj is self._search_field and event.type() == QEvent.KeyPress:
             key = event.key()
             if key == Qt.Key_Escape:
-                self.close()
+                if self._resident:
+                    self.hide_launchpad()
+                else:
+                    self.close()
                 return True
             if event.modifiers() == Qt.NoModifier and key in (Qt.Key_Right, Qt.Key_Down):
                 self.next_page()
@@ -1576,6 +1943,17 @@ class LaunchpadWindow(QWidget):
                 self.previous_page()
                 return True
         return super().eventFilter(obj, event)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._resident:
+            if self._suspend_auto_close:
+                event.ignore()
+                return
+            event.ignore()
+            self.hide_launchpad()
+            return
+        self.hidden.emit()
+        super().closeEvent(event)
 
     def _build_layout_items(self, apps: List[Application]) -> List[LayoutItem]:
         entries = _load_saved_layout_entries()
@@ -1646,15 +2024,20 @@ class LaunchpadWindow(QWidget):
             self._stack.removeWidget(widget)
             widget.deleteLater()
 
-    def _rebuild_pages(self) -> None:
+    def _rebuild_pages(self, preferred_page: int | None = None) -> None:
+        current_index = self._stack.currentIndex()
         self._clear_pages()
         items = self._filtered_items
         empty_text = "Нет установленных приложений"
         if self._all_apps and not items:
             empty_text = "Ничего не найдено"
         self._create_pages(items, empty_text)
-        if self._stack.count() > 0:
-            self._stack.setCurrentIndex(0)
+        page_count = self._stack.count()
+        if page_count > 0:
+            if preferred_page is None:
+                preferred_page = current_index if current_index >= 0 else 0
+            preferred_page = max(0, min(preferred_page, page_count - 1))
+            self._stack.setCurrentIndex(preferred_page)
         self._update_page_indicator()
 
     def _create_pages(self, items: List[LayoutItem], empty_text: str) -> None:
@@ -1692,7 +2075,8 @@ class LaunchpadWindow(QWidget):
             self._grids.append(grid_container)
             grid_container.set_max_content_height(self._grid_height_budget())
             page_widget.setFixedWidth(FULL_PAGE_WIDTH)
-            page_layout.addWidget(grid_container, alignment=Qt.AlignTop | Qt.AlignLeft)
+            page_layout.addStretch(1)
+            page_layout.addWidget(grid_container, alignment=Qt.AlignHCenter)
             page_layout.addStretch(1)
 
             self._stack.addWidget(page_widget)
@@ -1756,6 +2140,8 @@ class LaunchpadWindow(QWidget):
 
     def changeEvent(self, event) -> None:  # type: ignore[override]
         super().changeEvent(event)
+        if self._suspend_auto_close:
+            return
         if event.type() == QEvent.ActivationChange and not self.isActiveWindow():
             self.close()
 
@@ -1799,15 +2185,40 @@ class LaunchpadWindow(QWidget):
 
         return False
 
+    def prewarm_for_resident(self) -> None:
+        """Create the backing window off-screen so the first show is instant."""
+
+        if not self._resident or self._prewarmed:
+            return
+
+        original_attr = self.testAttribute(Qt.WA_DontShowOnScreen)
+        if not original_attr:
+            self.setAttribute(Qt.WA_DontShowOnScreen, True)
+
+        self._suspend_auto_close = True
+        try:
+            # Trigger native window creation and layout polish without surfacing
+            self.showFullScreen()
+            QApplication.processEvents()
+            QApplication.processEvents()
+            self.hide()
+            QApplication.processEvents()
+        finally:
+            self._suspend_auto_close = False
+            if not original_attr:
+                self.setAttribute(Qt.WA_DontShowOnScreen, False)
+
+        self._prewarmed = True
+
     def _on_search_text_changed(self, text: str) -> None:
         self._search_query = text.strip().lower()
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=0)
 
     def _update_page_indicator(self, _index: int | None = None) -> None:
         self._page_indicator.set_page_count(self._stack.count())
         self._page_indicator.set_current_page(self._stack.currentIndex())
 
-    def _update_filtered_items(self) -> None:
+    def _update_filtered_items(self, preferred_page: int | None = None) -> None:
         if not self._search_query:
             self._filtered_items = list(self._layout_items)
         else:
@@ -1818,7 +2229,7 @@ class LaunchpadWindow(QWidget):
                 if str(app.desktop_file) not in self._hidden_paths
                 and query in app.name.lower()
             ]
-        self._rebuild_pages()
+        self._rebuild_pages(preferred_page)
 
     def _remove_app_from_layout(self, desktop_path: str) -> bool:
         removed = False
@@ -1868,7 +2279,7 @@ class LaunchpadWindow(QWidget):
             _save_layout(self._layout_items)
 
         if added_to_hidden or removed:
-            self._update_filtered_items()
+            self._update_filtered_items(preferred_page=self._stack.currentIndex())
 
     def _on_reorder_requested(self, source_key: str, target_key: str, insert_before: bool) -> None:
         if source_key == target_key:
@@ -1893,7 +2304,7 @@ class LaunchpadWindow(QWidget):
         _save_layout(self._layout_items)
 
         if self._search_query:
-            self._update_filtered_items()
+            self._update_filtered_items(preferred_page=0)
             return
 
         self._filtered_items = list(self._layout_items)
@@ -1901,7 +2312,7 @@ class LaunchpadWindow(QWidget):
             source_key, target_key, insert_before
         ):
             return
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=self._stack.currentIndex())
 
     def _grid_height_budget(self) -> int:
         layout = self.layout()
@@ -1911,13 +2322,22 @@ class LaunchpadWindow(QWidget):
         available = self.height() - margins.top() - margins.bottom()
         if available <= 0:
             return 0
-        spacing = max(0, layout.spacing())
+        container_widget = getattr(self, "_content_container", None)
+        if isinstance(container_widget, QWidget):
+            container_layout = container_widget.layout()
+        else:
+            container_layout = None
+        spacing = 0
+        if isinstance(container_layout, QVBoxLayout):
+            spacing = max(0, container_layout.spacing())
         search_height = self._search_field.height() or self._search_field.sizeHint().height()
-        indicator_height = self._page_indicator.sizeHint().height()
+        indicator_height = (
+            self._page_indicator.height() or self._page_indicator.sizeHint().height()
+        )
         available -= search_height
         available -= indicator_height
         available -= 10
-        available -= spacing * 4
+        available -= spacing * 2
         available -= 2 * PAGE_CONTAINER_MARGIN
         return max(0, available)
 
@@ -1940,6 +2360,13 @@ class LaunchpadWindow(QWidget):
         return None
 
     def _on_merge_requested(self, payload: dict, target_key: str) -> None:
+        stack_index = self._stack.currentIndex()
+        if stack_index < 0:
+            stack_index = 0
+        stack_count = self._stack.count() if hasattr(self._stack, "count") else 0
+        if stack_count > 0:
+            stack_index = min(stack_index, stack_count - 1)
+
         kind = payload.get("kind") if isinstance(payload, dict) else None
         if kind != "app":
             return
@@ -1982,7 +2409,7 @@ class LaunchpadWindow(QWidget):
             return
 
         _save_layout(self._layout_items)
-        self._update_filtered_items()
+        self._update_filtered_items(preferred_page=stack_index)
 
     def _on_folder_button_clicked(self, folder_id: str, anchor_rect: QRect) -> None:
         folder = self._find_folder(folder_id)
@@ -2034,14 +2461,140 @@ class LaunchpadWindow(QWidget):
         _save_layout(self._layout_items)
 
 
-def main() -> None:
+class LaunchpadController(QObject):
+    """Accept commands over a UNIX socket to control the window lifecycle."""
+
+    def __init__(self, window: LaunchpadWindow, socket_path: Path) -> None:
+        super().__init__(window)
+        self._window = window
+        self._socket_path = socket_path
+        self._server = QLocalServer(self)
+        self._connections: list[QLocalSocket] = []
+
+        socket_path.parent.mkdir(parents=True, exist_ok=True)
+        QLocalServer.removeServer(str(socket_path))
+        try:
+            if socket_path.exists():
+                socket_path.unlink()
+        except OSError:
+            pass
+
+        if not self._server.listen(str(socket_path)):
+            raise RuntimeError(
+                f"Unable to bind launchpad control socket at {socket_path}: {self._server.errorString()}"
+            )
+
+        atexit.register(self._cleanup_socket)
+        self._server.newConnection.connect(self._on_new_connection)
+
+    def _cleanup_socket(self) -> None:
+        try:
+            if self._server.isListening():
+                self._server.close()
+        except RuntimeError:
+            pass
+        try:
+            if self._socket_path.exists():
+                self._socket_path.unlink()
+        except OSError:
+            pass
+
+    def _on_new_connection(self) -> None:
+        while self._server.hasPendingConnections():
+            socket = self._server.nextPendingConnection()
+            if socket is None:
+                continue
+            self._connections.append(socket)
+            socket.readyRead.connect(lambda s=socket: self._process_socket(s))
+            socket.disconnected.connect(lambda s=socket: self._remove_socket(s))
+
+    def _remove_socket(self, socket: QLocalSocket) -> None:
+        try:
+            socket.deleteLater()
+        except RuntimeError:
+            pass
+        if socket in self._connections:
+            self._connections.remove(socket)
+
+    def _process_socket(self, socket: QLocalSocket) -> None:
+        try:
+            data = bytes(socket.readAll())
+        except RuntimeError:
+            data = b""
+        if not data:
+            return
+        command = data.decode("utf-8", errors="ignore").strip()
+        response = self._handle_command(command)
+        try:
+            socket.write(response.encode("utf-8"))
+            socket.flush()
+        except RuntimeError:
+            pass
+        finally:
+            try:
+                socket.disconnectFromServer()
+            except RuntimeError:
+                pass
+
+    def _handle_command(self, command: str) -> str:
+        normalized = command.strip().lower()
+        if not normalized:
+            return "ERROR Empty command"
+        if normalized == "open":
+            self._window.show_launchpad()
+            return "OK Launchpad shown"
+        if normalized == "hide":
+            self._window.hide_launchpad()
+            return "OK Launchpad hidden"
+        if normalized == "warmup":
+            self._window.prewarm_for_resident()
+            return "OK Launchpad warmed"
+        if normalized == "ping":
+            return "OK Launchpad ready"
+        return f"ERROR Unknown command: {command}"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="LPAD application grid")
+    parser.add_argument(
+        "--resident",
+        action="store_true",
+        help="Keep the launchpad process alive for fast activation",
+    )
+    parser.add_argument(
+        "--control-socket",
+        metavar="PATH",
+        default=str(DEFAULT_CONTROL_SOCKET),
+        help="Path to the UNIX socket used for resident mode commands",
+    )
+    args = parser.parse_args()
+
     apps = load_applications()
     app = QApplication(sys.argv)
-    window = LaunchpadWindow(apps)
-    window.showFullScreen()
-    sys.exit(app.exec_())
+    if args.resident:
+        app.setQuitOnLastWindowClosed(False)
+    window = LaunchpadWindow(apps, resident=args.resident)
+
+    controller: LaunchpadController | None = None
+    if args.resident:
+        socket_path = Path(args.control_socket)
+        try:
+            controller = LaunchpadController(window, socket_path)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        window.prewarm_for_resident()
+
+    if not args.resident:
+        window.showFullScreen()
+
+    # Keep references alive for the lifetime of the application.
+    _ = controller
+
+    app.exec_()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
